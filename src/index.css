@@ -1,0 +1,81 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  /* ── Light ─────────────────────────────────────── */
+  :root,
+  .light {
+    --background:       220 18% 97%;
+    --foreground:       222 40% 11%;
+    --card:             0 0% 100%;
+    --card-foreground:  222 40% 11%;
+    --border:           220 13% 87%;
+    --input:            220 13% 87%;
+    --primary:          217 91% 52%;
+    --primary-foreground: 0 0% 100%;
+    --secondary:        220 14% 93%;
+    --secondary-foreground: 222 40% 25%;
+    --muted:            220 14% 93%;
+    --muted-foreground: 215 16% 47%;
+    --accent:           220 14% 91%;
+    --accent-foreground: 222 40% 11%;
+    --ring:             217 91% 52%;
+    --radius:           0.6rem;
+  }
+
+  /* ── Dark ──────────────────────────────────────── */
+  .dark {
+    --background:       222 14% 8%;
+    --foreground:       210 20% 92%;
+    --card:             222 14% 11%;
+    --card-foreground:  210 20% 92%;
+    --border:           217 12% 18%;
+    --input:            217 12% 18%;
+    --primary:          217 91% 60%;
+    --primary-foreground: 0 0% 100%;
+    --secondary:        217 12% 15%;
+    --secondary-foreground: 210 20% 80%;
+    --muted:            217 12% 14%;
+    --muted-foreground: 215 16% 50%;
+    --accent:           217 12% 16%;
+    --accent-foreground: 210 20% 92%;
+    --ring:             217 91% 60%;
+    --radius:           0.6rem;
+  }
+
+  /* ── Midnight ──────────────────────────────────── */
+  .midnight {
+    --background:       250 20% 6%;
+    --foreground:       248 30% 91%;
+    --card:             250 18% 10%;
+    --card-foreground:  248 30% 91%;
+    --border:           250 14% 18%;
+    --input:            250 14% 18%;
+    --primary:          258 90% 68%;
+    --primary-foreground: 0 0% 100%;
+    --secondary:        250 14% 13%;
+    --secondary-foreground: 248 25% 75%;
+    --muted:            250 14% 13%;
+    --muted-foreground: 250 15% 52%;
+    --accent:           250 14% 15%;
+    --accent-foreground: 248 30% 91%;
+    --ring:             258 90% 68%;
+    --radius:           0.6rem;
+  }
+
+  * {
+    @apply border-border;
+  }
+
+  body {
+    @apply bg-background text-foreground;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    -webkit-font-smoothing: antialiased;
+  }
+
+  ::-webkit-scrollbar        { width: 6px; height: 6px; }
+  ::-webkit-scrollbar-track  { background: hsl(var(--background)); }
+  ::-webkit-scrollbar-thumb  { background: hsl(var(--border)); border-radius: 3px; }
+  ::-webkit-scrollbar-thumb:hover { background: hsl(var(--muted-foreground)); }
+}
