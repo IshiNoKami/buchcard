@@ -1,7 +1,78 @@
 use anyhow::Result;
+use regex::Regex;
 use serde::{Deserialize, Serialize};
+use std::sync::OnceLock;
 
-use crate::db::{MerchantCache, Transaction};
+use crate::db::Transaction;
+
+// MCC code → app category mapping
+const MCC_CATEGORY: &[(u16, &str)] = &[
+    (742,  "Питомцы"),
+    (4111, "Транспорт/Такси"),
+    (4131, "Транспорт/Такси"),
+    (4789, "Транспорт/Такси"),
+    (5137, "Одежда/Обувь"),
+    (5139, "Одежда/Обувь"),
+    (5297, "Продукты"),
+    (5298, "Продукты"),
+    (5300, "Продукты"),
+    (5309, "Покупки/Маркетплейс"),
+    (5331, "Покупки/Маркетплейс"),
+    (5399, "Прочее"),
+    (5411, "Продукты"),
+    (5412, "Продукты"),
+    (5422, "Продукты"),
+    (5441, "Кафе/Рестораны"),
+    (5451, "Продукты"),
+    (5462, "Кафе/Рестораны"),
+    (5499, "Продукты"),
+    (5521, "Автоуслуги"),
+    (5531, "Автоуслуги"),
+    (5532, "Автоуслуги"),
+    (5533, "Автоуслуги"),
+    (5611, "Одежда/Обувь"),
+    (5621, "Одежда/Обувь"),
+    (5631, "Одежда/Обувь"),
+    (5641, "Одежда/Обувь"),
+    (5651, "Одежда/Обувь"),
+    (5655, "Спорт"),
+    (5661, "Одежда/Обувь"),
+    (5681, "Одежда/Обувь"),
+    (5691, "Одежда/Обувь"),
+    (5697, "Одежда/Обувь"),
+    (5698, "Одежда/Обувь"),
+    (5699, "Одежда/Обувь"),
+    (5715, "Продукты"),
+    (5811, "Кафе/Рестораны"),
+    (5812, "Кафе/Рестораны"),
+    (5813, "Кафе/Рестораны"),
+    (5814, "Кафе/Рестораны"),
+    (5931, "Одежда/Обувь"),
+    (5940, "Спорт"),
+    (5941, "Спорт"),
+    (5948, "Одежда/Обувь"),
+    (5949, "Одежда/Обувь"),
+    (5995, "Питомцы"),
+    (7296, "Одежда/Обувь"),
+    (7372, "Прочее"),
+    (7531, "Автоуслуги"),
+    (7534, "Автоуслуги"),
+    (7535, "Автоуслуги"),
+    (7538, "Автоуслуги"),
+    (7542, "Автоуслуги"),
+    (7992, "Спорт"),
+    (7997, "Спорт"),
+    (8999, "Прочее"),
+    (3990, "Подписки/Сервисы"),
+];
+
+static RE_MCC: OnceLock<Regex> = OnceLock::new();
+
+pub fn mcc_match(description: &str) -> Option<String> {
+    let re = RE_MCC.get_or_init(|| Regex::new(r"(?i)MCC\s*(\d{4})").unwrap());
+    let code: u16 = re.captures(description)?.get(1)?.as_str().parse().ok()?;
+    MCC_CATEGORY.iter().find(|(c, _)| *c == code).map(|(_, cat)| cat.to_string())
+}
 
 const CATEGORY_RULES: &[(&str, &[&str])] = &[
     ("Продукты", &["yarche", "lenta", "universam abrikos", "evo_fresh", "evo fresh",
@@ -50,13 +121,13 @@ pub fn keyword_match(merchant_key: &str, raw_description: &str) -> Option<String
 
 #[derive(Debug, Serialize, Deserialize)]
 pub(crate) struct OllamaLlmResponse {
-    category: String,
-    confidence: f64,
-    reasoning: String,
+    pub category: String,
+    pub confidence: f64,
+    pub reasoning: String,
 }
 
 
-pub fn llm_classify(
+pub async fn llm_classify_async(
     raw_description: &str,
     merchant_key: &str,
     categories: &[String],
@@ -97,17 +168,16 @@ pub fn llm_classify(
     let endpoint = endpoint.replace("localhost", "127.0.0.1");
     let url = format!("{}/api/chat", endpoint.trim_end_matches('/'));
 
-    let mut builder = reqwest::blocking::Client::builder()
-        .timeout(std::time::Duration::from_secs(120))
-        .build()?
-        .post(&url)
-        .json(&req);
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(45))
+        .build()?;
 
+    let mut builder = client.post(&url).json(&req);
     if !api_key.is_empty() {
         builder = builder.header("Authorization", format!("Bearer {}", api_key));
     }
 
-    let resp: serde_json::Value = builder.send()?.json()?;
+    let resp: serde_json::Value = builder.send().await?.json().await?;
 
     let content = resp["message"]["content"]
         .as_str()
@@ -124,70 +194,3 @@ pub struct CategorizedTx {
     pub reasoning: Option<String>,
 }
 
-pub fn categorize_one(
-    tx: &Transaction,
-    conn: &rusqlite::Connection,
-    categories: &[String],
-    merchant_index: &mut crate::normalizer::MerchantIndex,
-    endpoint: &str,
-    api_key: &str,
-    model: &str,
-) -> Result<CategorizedTx> {
-    let mk = merchant_index.resolve(&tx.merchant_key);
-
-    // 1. Keyword match
-    if let Some(cat) = keyword_match(&mk, &tx.description) {
-        let mc = MerchantCache {
-            merchant_key: mk.clone(),
-            category: cat.clone(),
-            source: "keyword".to_string(),
-            confidence: Some(1.0),
-            reasoning: Some("keyword match".to_string()),
-        };
-        crate::db::upsert_merchant(conn, &mc).ok();
-        return Ok(CategorizedTx {
-            tx: Transaction { merchant_key: mk, category: cat, ..tx.clone() },
-            source: "keyword".to_string(),
-            confidence: Some(1.0),
-            reasoning: Some("keyword match".to_string()),
-        });
-    }
-
-    // 2. Cache lookup
-    if let Ok(Some(cached)) = crate::db::cache_lookup(conn, &mk) {
-        return Ok(CategorizedTx {
-            tx: Transaction { merchant_key: mk, category: cached.category.clone(), ..tx.clone() },
-            source: cached.source.clone(),
-            confidence: cached.confidence,
-            reasoning: cached.reasoning.clone(),
-        });
-    }
-
-    // 3. Ollama
-    let (category, confidence, reasoning) = match llm_classify(&tx.description, &mk, categories, endpoint, api_key, model) {
-        Ok(r) => {
-            let cat = if categories.contains(&r.category) { r.category } else { "Прочее".to_string() };
-            (cat, Some(r.confidence), Some(r.reasoning))
-        }
-        Err(e) => {
-            eprintln!("[LLM] error for {mk}: {e}");
-            ("Прочее".to_string(), Some(0.0), Some("ошибка классификации".to_string()))
-        }
-    };
-
-    let mc = MerchantCache {
-        merchant_key: mk.clone(),
-        category: category.clone(),
-        source: "llm".to_string(),
-        confidence,
-        reasoning: reasoning.clone(),
-    };
-    crate::db::upsert_merchant(conn, &mc).ok();
-
-    Ok(CategorizedTx {
-        tx: Transaction { merchant_key: mk, category: category.clone(), ..tx.clone() },
-        source: "llm".to_string(),
-        confidence,
-        reasoning,
-    })
-}

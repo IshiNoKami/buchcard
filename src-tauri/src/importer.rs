@@ -19,7 +19,7 @@ fn is_internal(desc: &str) -> bool {
     INTERNAL_KEYWORDS.iter().any(|kw| d.contains(kw))
 }
 
-fn tx_hash(date: &str, amount: f64, description: &str) -> String {
+pub(crate) fn tx_hash(date: &str, amount: f64, description: &str) -> String {
     let prefix: String = description.chars().take(40).collect();
     let key = format!("{}|{}|{}", date, amount, prefix);
     let mut hasher = Sha1::new();
@@ -86,6 +86,7 @@ pub fn parse_xls(filepath: &Path) -> Result<Vec<Transaction>> {
             merchant_key,
             category: String::new(),
             tx_hash: hash,
+            is_income: false,
         });
     }
 

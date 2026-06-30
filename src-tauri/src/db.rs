@@ -2,6 +2,7 @@ use anyhow::Result;
 use rusqlite::{Connection, params};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
+use crate::normalizer::normalize_merchant;
 
 pub fn db_path() -> PathBuf {
     let mut p = dirs_next::data_dir().unwrap_or_else(|| PathBuf::from("."));
@@ -54,21 +55,28 @@ pub fn init(conn: &Connection) -> Result<()> {
             description  TEXT NOT NULL,
             merchant_key TEXT NOT NULL,
             category     TEXT NOT NULL,
-            tx_hash      TEXT NOT NULL UNIQUE
+            tx_hash      TEXT NOT NULL UNIQUE,
+            is_income    INTEGER NOT NULL DEFAULT 0
         );
     ")?;
+    conn.execute_batch("ALTER TABLE transactions ADD COLUMN is_income INTEGER NOT NULL DEFAULT 0").ok();
+    conn.execute_batch("ALTER TABLE imports ADD COLUMN balance REAL").ok();
 
     let default_cats = vec![
+        ("Доход", "#22C55E"),
         ("Продукты", "#4CAF50"),
         ("Кафе/Рестораны", "#FF9800"),
         ("Транспорт/Такси", "#2196F3"),
         ("ЖКХ + Связь", "#9C27B0"),
         ("Копилка/Сбережения", "#00BCD4"),
         ("Покупки/Маркетплейс", "#F44336"),
+        ("Одежда/Обувь", "#EC4899"),
         ("Здоровье", "#E91E63"),
         ("Подписки/Сервисы", "#607D8B"),
         ("Развлечения", "#FF5722"),
         ("Спорт", "#8BC34A"),
+        ("Питомцы", "#F59E0B"),
+        ("Автоуслуги", "#64748B"),
         ("Переводы", "#795548"),
         ("Прочее", "#9E9E9E"),
     ];
@@ -94,11 +102,12 @@ pub struct Import {
     pub period_from: String,
     pub period_to: String,
     pub imported_at: String,
+    pub balance: Option<f64>,
 }
 
 pub fn get_imports(conn: &Connection) -> Result<Vec<Import>> {
     let mut stmt = conn.prepare(
-        "SELECT id, filename, period_from, period_to, imported_at FROM imports ORDER BY period_from DESC"
+        "SELECT id, filename, period_from, period_to, imported_at, balance FROM imports ORDER BY period_from DESC"
     )?;
     let rows = stmt.query_map([], |row| {
         Ok(Import {
@@ -107,6 +116,7 @@ pub fn get_imports(conn: &Connection) -> Result<Vec<Import>> {
             period_from: row.get(2)?,
             period_to: row.get(3)?,
             imported_at: row.get(4)?,
+            balance: row.get(5)?,
         })
     })?;
     Ok(rows.filter_map(|r| r.ok()).collect())
@@ -130,11 +140,12 @@ pub struct Transaction {
     pub merchant_key: String,
     pub category: String,
     pub tx_hash: String,
+    pub is_income: bool,
 }
 
 pub fn get_transactions(conn: &Connection) -> Result<Vec<Transaction>> {
     let mut stmt = conn.prepare(
-        "SELECT id, import_id, date, amount, description, merchant_key, category, tx_hash
+        "SELECT id, import_id, date, amount, description, merchant_key, category, tx_hash, is_income
          FROM transactions ORDER BY date DESC"
     )?;
     let rows = stmt.query_map([], |row| {
@@ -147,6 +158,7 @@ pub fn get_transactions(conn: &Connection) -> Result<Vec<Transaction>> {
             merchant_key: row.get(5)?,
             category: row.get(6)?,
             tx_hash: row.get(7)?,
+            is_income: row.get::<_, i64>(8).map(|v| v != 0).unwrap_or(false),
         })
     })?;
     Ok(rows.filter_map(|r| r.ok()).collect())
@@ -201,10 +213,10 @@ pub fn upsert_merchant(conn: &Connection, mc: &MerchantCache) -> Result<()> {
     Ok(())
 }
 
-pub fn create_import(conn: &Connection, filename: &str, period_from: &str, period_to: &str) -> Result<i64> {
+pub fn create_import(conn: &Connection, filename: &str, period_from: &str, period_to: &str, balance: Option<f64>) -> Result<i64> {
     conn.execute(
-        "INSERT INTO imports (filename, period_from, period_to) VALUES (?1, ?2, ?3)",
-        params![filename, period_from, period_to],
+        "INSERT INTO imports (filename, period_from, period_to, balance) VALUES (?1, ?2, ?3, ?4)",
+        params![filename, period_from, period_to, balance],
     )?;
     Ok(conn.last_insert_rowid())
 }
@@ -212,11 +224,12 @@ pub fn create_import(conn: &Connection, filename: &str, period_from: &str, perio
 pub fn commit_transactions(conn: &Connection, import_id: i64, txs: &[Transaction]) -> Result<usize> {
     let mut inserted = 0;
     for tx in txs {
+        let is_income_int: i64 = if tx.is_income { 1 } else { 0 };
         match conn.execute("
             INSERT OR IGNORE INTO transactions
-                (import_id, date, amount, description, merchant_key, category, tx_hash)
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
-        ", params![import_id, tx.date, tx.amount, tx.description, tx.merchant_key, tx.category, tx.tx_hash]) {
+                (import_id, date, amount, description, merchant_key, category, tx_hash, is_income)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+        ", params![import_id, tx.date, tx.amount, tx.description, tx.merchant_key, tx.category, tx.tx_hash, is_income_int]) {
             Ok(n) => inserted += n,
             Err(_) => {}
         }
@@ -229,6 +242,10 @@ pub struct Settings {
     pub endpoint: String,
     pub api_key: String,
     pub model: String,
+    pub advance_day: Option<u8>,
+    pub advance_amount: Option<f64>,
+    pub salary_day: Option<u8>,
+    pub salary_amount: Option<f64>,
 }
 
 impl Default for Settings {
@@ -237,6 +254,10 @@ impl Default for Settings {
             endpoint: "http://localhost:11434".into(),
             api_key: String::new(),
             model: "qwen2.5:14b".into(),
+            advance_day: None,
+            advance_amount: None,
+            salary_day: None,
+            salary_amount: None,
         }
     }
 }
@@ -247,9 +268,13 @@ pub fn get_settings(conn: &Connection) -> Result<Settings> {
     let rows = stmt.query_map([], |row| Ok((row.get::<_,String>(0)?, row.get::<_,String>(1)?)))?;
     for row in rows.flatten() {
         match row.0.as_str() {
-            "endpoint" => s.endpoint = row.1,
-            "api_key"  => s.api_key  = row.1,
-            "model"    => s.model    = row.1,
+            "endpoint"       => s.endpoint        = row.1,
+            "api_key"        => s.api_key         = row.1,
+            "model"          => s.model           = row.1,
+            "advance_day"    => s.advance_day     = row.1.parse().ok(),
+            "advance_amount" => s.advance_amount  = row.1.parse().ok(),
+            "salary_day"     => s.salary_day      = row.1.parse().ok(),
+            "salary_amount"  => s.salary_amount   = row.1.parse().ok(),
             _ => {}
         }
     }
@@ -257,12 +282,20 @@ pub fn get_settings(conn: &Connection) -> Result<Settings> {
 }
 
 pub fn save_settings(conn: &Connection, s: &Settings) -> Result<()> {
-    for (k, v) in [("endpoint", &s.endpoint), ("api_key", &s.api_key), ("model", &s.model)] {
+    let upsert = |k: &str, v: &str| -> Result<()> {
         conn.execute(
             "INSERT INTO settings(key,value) VALUES(?1,?2) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
             params![k, v],
         )?;
-    }
+        Ok(())
+    };
+    upsert("endpoint", &s.endpoint)?;
+    upsert("api_key",  &s.api_key)?;
+    upsert("model",    &s.model)?;
+    upsert("advance_day",    &s.advance_day.map(|v| v.to_string()).unwrap_or_default())?;
+    upsert("advance_amount", &s.advance_amount.map(|v| v.to_string()).unwrap_or_default())?;
+    upsert("salary_day",     &s.salary_day.map(|v| v.to_string()).unwrap_or_default())?;
+    upsert("salary_amount",  &s.salary_amount.map(|v| v.to_string()).unwrap_or_default())?;
     Ok(())
 }
 
@@ -272,6 +305,17 @@ pub fn add_category(conn: &Connection, name: &str, color: &str) -> Result<()> {
         params![name, color],
     )?;
     Ok(())
+}
+
+pub fn delete_transaction(conn: &Connection, id: i64) -> Result<()> {
+    conn.execute("DELETE FROM transactions WHERE id = ?1", params![id])?;
+    Ok(())
+}
+
+pub fn delete_import(conn: &Connection, import_id: i64) -> Result<usize> {
+    let deleted = conn.execute("DELETE FROM transactions WHERE import_id = ?1", params![import_id])?;
+    conn.execute("DELETE FROM imports WHERE id = ?1", params![import_id])?;
+    Ok(deleted)
 }
 
 // ─── Analytics (used by AI chat) ──────────────────────────────────────────────
@@ -284,6 +328,9 @@ pub struct SpendingSummary {
     pub tx_count: i64,
     pub from_date: String,
     pub to_date: String,
+    pub days_in_period: i64,
+    pub daily_avg: f64,
+    pub monthly_projection: f64,
 }
 
 #[derive(Debug, Serialize)]
@@ -326,21 +373,30 @@ pub fn get_data_period(conn: &Connection) -> Result<DataPeriod> {
     Ok(DataPeriod { first_date: first, last_date: last, total_transactions: count })
 }
 
-// Note: importer stores only expenses, all amounts are positive (negated at import time)
 pub fn get_spending_summary(conn: &Connection, from: &str, to: &str) -> Result<SpendingSummary> {
-    let (expense, count): (f64, i64) = conn.query_row(
-        "SELECT COALESCE(SUM(amount), 0), COUNT(*)
+    let (expense, income, count, days): (f64, f64, i64, i64) = conn.query_row(
+        "SELECT
+            COALESCE(SUM(CASE WHEN is_income=0 THEN amount ELSE 0 END), 0),
+            COALESCE(SUM(CASE WHEN is_income=1 THEN amount ELSE 0 END), 0),
+            COUNT(*),
+            CAST(JULIANDAY(?2) - JULIANDAY(?1) + 1 AS INTEGER)
          FROM transactions WHERE date >= ?1 AND date <= ?2",
         params![from, to],
-        |row| Ok((row.get(0)?, row.get(1)?)),
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
     )?;
+    let days = days.max(1);
+    let daily_avg = (expense / days as f64 * 100.0).round() / 100.0;
+    let monthly_projection = (daily_avg * 30.0 * 100.0).round() / 100.0;
     Ok(SpendingSummary {
         total_expense: expense,
-        total_income: 0.0,
-        net: -expense,
+        total_income: income,
+        net: income - expense,
         tx_count: count,
         from_date: from.to_string(),
         to_date: to.to_string(),
+        days_in_period: days,
+        daily_avg,
+        monthly_projection,
     })
 }
 
@@ -384,6 +440,37 @@ pub fn get_monthly_totals(conn: &Connection, months: i64) -> Result<Vec<MonthlyT
         })
     })?;
     Ok(rows.filter_map(|r| r.ok()).collect())
+}
+
+/// One-time migration: re-apply normalize_merchant to all stored descriptions.
+/// Runs only once (guarded by 'merchant_renorm_v2' settings key).
+pub fn renormalize_merchant_keys(conn: &Connection) -> Result<()> {
+    let done = conn.query_row(
+        "SELECT value FROM settings WHERE key = 'merchant_renorm_v2'",
+        [],
+        |row| row.get::<_, String>(0),
+    ).map(|v| v == "1").unwrap_or(false);
+    if done { return Ok(()); }
+
+    let pairs: Vec<(i64, String)> = {
+        let mut stmt = conn.prepare("SELECT id, description FROM transactions")?;
+        let v: Vec<(i64, String)> = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+            .filter_map(|r| r.ok())
+            .collect();
+        v
+    };
+
+    for (id, desc) in pairs {
+        let new_key = normalize_merchant(&desc);
+        conn.execute("UPDATE transactions SET merchant_key = ?1 WHERE id = ?2", params![new_key, id])?;
+    }
+
+    conn.execute(
+        "INSERT INTO settings(key,value) VALUES('merchant_renorm_v2','1')
+         ON CONFLICT(key) DO UPDATE SET value='1'",
+        [],
+    )?;
+    Ok(())
 }
 
 pub fn get_merchant_totals(conn: &Connection, from: &str, to: &str, limit: i64) -> Result<Vec<MerchantTotal>> {

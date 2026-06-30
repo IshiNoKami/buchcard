@@ -4,6 +4,7 @@ mod commands;
 mod db;
 mod importer;
 mod normalizer;
+mod pdf_parser;
 
 use commands::AppState;
 use std::sync::Mutex;
@@ -12,6 +13,7 @@ use std::sync::Mutex;
 pub fn run() {
     let conn = db::open().expect("Failed to open DB");
     db::init(&conn).expect("Failed to init DB");
+    db::renormalize_merchant_keys(&conn).ok();
 
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
@@ -31,6 +33,10 @@ pub fn run() {
             commands::parse_file,
             commands::categorize_transactions,
             commands::commit_import,
+            commands::delete_transaction,
+            commands::delete_import,
+            commands::parse_pdf_preview,
+            commands::pdf_rows_to_transactions,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

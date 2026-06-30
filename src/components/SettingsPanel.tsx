@@ -3,11 +3,36 @@ import { invoke } from "@tauri-apps/api/core";
 import { X, RefreshCw, Eye, EyeOff, Check, Play } from "lucide-react";
 import { Button } from "./ui/button";
 import { useTheme, THEMES, Theme } from "../lib/theme";
+import { Settings } from "../lib/types";
 
-interface Settings {
-  endpoint: string;
-  api_key: string;
-  model: string;
+const DAYS_RU = ["вс", "пн", "вт", "ср", "чт", "пт", "сб"];
+const MONTHS_RU = ["янв", "фев", "мар", "апр", "май", "июн", "июл", "авг", "сен", "окт", "ноя", "дек"];
+
+function nextPayDate(day: number): { date: Date; adjusted: boolean } | null {
+  if (!day || day < 1 || day > 31) return null;
+  const today = new Date(); today.setHours(0, 0, 0, 0);
+  const calc = (y: number, m: number) => {
+    const lastDay = new Date(y, m + 1, 0).getDate();
+    const d = Math.min(day, lastDay);
+    const date = new Date(y, m, d);
+    const dow = date.getDay();
+    const adjusted = dow === 0 || dow === 6;
+    if (dow === 0) date.setDate(date.getDate() - 2);
+    else if (dow === 6) date.setDate(date.getDate() - 1);
+    return { date, adjusted };
+  };
+  let y = today.getFullYear(), m = today.getMonth();
+  let r = calc(y, m);
+  if (r.date < today) { m++; if (m > 11) { m = 0; y++; } r = calc(y, m); }
+  return r;
+}
+
+function formatPayDate(day: number): string {
+  const r = nextPayDate(day);
+  if (!r) return "";
+  const { date, adjusted } = r;
+  const d = date.getDate(), mo = MONTHS_RU[date.getMonth()], dow = DAYS_RU[date.getDay()];
+  return adjusted ? `${d} ${mo} (${dow}) — перенос с ${day}-го` : `${d} ${mo} (${dow})`;
 }
 
 interface ModelInfo {
@@ -24,6 +49,10 @@ export function SettingsPanel({ onClose }: Props) {
     endpoint: "http://localhost:11434",
     api_key: "",
     model: "qwen2.5:14b",
+    advance_day: undefined,
+    advance_amount: undefined,
+    salary_day: undefined,
+    salary_amount: undefined,
   });
   const [models, setModels] = useState<string[]>([]);
   const [loadingModels, setLoadingModels] = useState(false);
@@ -130,6 +159,52 @@ export function SettingsPanel({ onClose }: Props) {
                   {t.label}
                 </button>
               ))}
+            </div>
+          </section>
+
+          {/* Salary / Advance */}
+          <section>
+            <p className="text-xs font-medium text-muted-foreground uppercase tracking-wider mb-3">Выплаты</p>
+            <div className="space-y-3">
+              {(["advance", "salary"] as const).map(type => {
+                const dayKey   = type === "advance" ? "advance_day"    : "salary_day";
+                const amtKey   = type === "advance" ? "advance_amount" : "salary_amount";
+                const label    = type === "advance" ? "Аванс" : "Зарплата";
+                const dayVal   = settings[dayKey] ?? "";
+                const amtVal   = settings[amtKey] ?? "";
+                const preview  = dayVal ? formatPayDate(Number(dayVal)) : "";
+                return (
+                  <div key={type}>
+                    <p className="text-xs text-muted-foreground mb-1.5">{label}</p>
+                    <div className="flex gap-2 items-center">
+                      <div className="relative w-20">
+                        <input
+                          type="number" min={1} max={31}
+                          value={dayVal}
+                          onChange={e => setSettings(s => ({ ...s, [dayKey]: e.target.value ? Number(e.target.value) : undefined }))}
+                          placeholder="день"
+                          className="w-full px-3 py-2 rounded-lg border border-border bg-background text-sm focus:outline-none focus:ring-1 focus:ring-primary"
+                        />
+                      </div>
+                      <input
+                        type="number" min={0}
+                        value={amtVal}
+                        onChange={e => setSettings(s => ({ ...s, [amtKey]: e.target.value ? Number(e.target.value) : undefined }))}
+                        placeholder="сумма, ₽"
+                        className="flex-1 px-3 py-2 rounded-lg border border-border bg-background text-sm focus:outline-none focus:ring-1 focus:ring-primary"
+                      />
+                    </div>
+                    {preview && (
+                      <p className="text-xs text-muted-foreground mt-1 pl-0.5">
+                        Ближайшая выплата: <span className="text-foreground">{preview}</span>
+                      </p>
+                    )}
+                  </div>
+                );
+              })}
+              <p className="text-xs text-muted-foreground/70">
+                Если день выплаты выпадает на выходной — переносится на пятницу перед ним.
+              </p>
             </div>
           </section>
 

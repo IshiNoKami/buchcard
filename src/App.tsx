@@ -6,7 +6,7 @@ import { SpendingPie, TopMerchantsBar, DailyArea } from "./components/dashboard/
 import { TransactionTable } from "./components/dashboard/TransactionTable";
 import { ImportWizard } from "./components/wizard/ImportWizard";
 import { Button } from "./components/ui/button";
-import { Upload, RefreshCw, CreditCard, Calendar, Settings, MessageSquare } from "lucide-react";
+import { Upload, RefreshCw, CreditCard, Calendar, Settings, MessageSquare, Trash2, ChevronDown } from "lucide-react";
 import { DateRangePicker, DateRange } from "./components/ui/date-range-picker";
 import { useTheme, THEMES } from "./lib/theme";
 import { SettingsPanel } from "./components/SettingsPanel";
@@ -39,11 +39,16 @@ export default function App() {
   const [imports, setImports] = useState<Import[]>([]);
   const [selectedImport, setSelectedImport] = useState<Import | null>(null);
   const [customRange, setCustomRange] = useState<DateRange | null>(null);
+  const [period, setPeriod] = useState<"30d" | "90d" | "all">("30d");
+  const [showImports, setShowImports] = useState(false);
   const [showWizard, setShowWizard] = useState(false);
   const [showSettings, setShowSettings] = useState(false);
   const [showChat, setShowChat] = useState(false);
   const [aiStatus, setAiStatus] = useState<"checking" | "online" | "offline">("checking");
   const [loading, setLoading] = useState(true);
+  const [deleteSelection, setDeleteSelection] = useState<Set<number>>(new Set());
+  const [confirmBulkDelete, setConfirmBulkDelete] = useState(false);
+  const [bulkDeleting, setBulkDeleting] = useState(false);
 
   const load = useCallback(async () => {
     setLoading(true);
@@ -68,18 +73,47 @@ export default function App() {
     load();
   };
 
+  const toggleDeleteSelection = (id: number) => {
+    setDeleteSelection(prev => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id); else next.add(id);
+      return next;
+    });
+  };
+
+  const handleBulkDelete = async () => {
+    setBulkDeleting(true);
+    try {
+      for (const id of deleteSelection) {
+        await invoke("delete_import", { importId: id });
+      }
+      if (selectedImport && deleteSelection.has(selectedImport.id)) setSelectedImport(null);
+      setDeleteSelection(new Set());
+      setConfirmBulkDelete(false);
+      await load();
+    } finally {
+      setBulkDeleting(false);
+    }
+  };
+
   const activeDates = useMemo(() => new Set(transactions.map(tx => tx.date)), [transactions]);
 
   const filtered = useMemo(() => {
-    if (customRange) {
-      return transactions.filter(tx => tx.date >= customRange.from && tx.date <= customRange.to);
-    }
     if (selectedImport) {
       const { period_from, period_to } = selectedImport;
       return transactions.filter(tx => tx.date >= period_from && tx.date <= period_to);
     }
+    if (customRange) {
+      return transactions.filter(tx => tx.date >= customRange.from && tx.date <= customRange.to);
+    }
+    if (period !== "all") {
+      const days = period === "30d" ? 30 : 90;
+      const from = new Date(Date.now() - days * 86_400_000).toISOString().slice(0, 10);
+      const to   = new Date().toISOString().slice(0, 10);
+      return transactions.filter(tx => tx.date >= from && tx.date <= to);
+    }
     return transactions;
-  }, [transactions, selectedImport, customRange]);
+  }, [transactions, selectedImport, customRange, period]);
 
   return (
     <div className="min-h-screen bg-background">
@@ -141,44 +175,96 @@ export default function App() {
           </div>
 
           {/* Period filter */}
-          {imports.length > 0 && (
+          <div className="space-y-2">
             <div className="flex items-center gap-2 flex-wrap">
               <Calendar className="h-3.5 w-3.5 text-muted-foreground shrink-0" />
-              <button
-                onClick={() => { setSelectedImport(null); setCustomRange(null); }}
-                className={`px-3 py-1 rounded-full text-xs border transition-colors ${
-                  selectedImport === null && customRange === null
-                    ? "bg-primary text-primary-foreground border-primary"
-                    : "border-border text-muted-foreground hover:border-primary/50 hover:text-foreground"
-                }`}
-              >
-                Все периоды
-              </button>
-              {imports.map(imp => (
+
+              {/* Quick period buttons */}
+              {(["30d", "90d", "all"] as const).map(p => (
                 <button
-                  key={imp.id}
-                  onClick={() => {
-                    setCustomRange(null);
-                    setSelectedImport(prev => prev?.id === imp.id ? null : imp);
-                  }}
-                  title={imp.filename}
+                  key={p}
+                  onClick={() => { setPeriod(p); setCustomRange(null); setSelectedImport(null); }}
                   className={`px-3 py-1 rounded-full text-xs border transition-colors ${
-                    selectedImport?.id === imp.id
+                    period === p && !customRange && !selectedImport
                       ? "bg-primary text-primary-foreground border-primary"
                       : "border-border text-muted-foreground hover:border-primary/50 hover:text-foreground"
                   }`}
                 >
-                  {formatPeriod(imp.period_from, imp.period_to)}
+                  {p === "30d" ? "30 дней" : p === "90d" ? "90 дней" : "Всё"}
                 </button>
               ))}
+
               <div className="w-px h-4 bg-border" />
               <DateRangePicker
                 value={customRange}
                 activeDates={activeDates}
                 onChange={range => { setCustomRange(range); if (range) setSelectedImport(null); }}
               />
+
+              {imports.length > 0 && (
+                <>
+                  <div className="w-px h-4 bg-border" />
+                  <button
+                    onClick={() => setShowImports(v => !v)}
+                    className={`flex items-center gap-1 px-3 py-1 rounded-full text-xs border transition-colors ${
+                      showImports || !!selectedImport
+                        ? "bg-primary/10 border-primary/40 text-primary"
+                        : "border-border text-muted-foreground hover:border-primary/50 hover:text-foreground"
+                    }`}
+                  >
+                    Импорты ({imports.length})
+                    <ChevronDown className={`h-3 w-3 transition-transform ${showImports ? "rotate-180" : ""}`} />
+                  </button>
+                </>
+              )}
             </div>
-          )}
+
+            {/* Collapsible import pills */}
+            {showImports && imports.length > 0 && (
+              <div className="flex items-center gap-2 flex-wrap pl-5">
+                {imports.map(imp => {
+                  const marked = deleteSelection.has(imp.id);
+                  return (
+                    <div key={imp.id} className="flex items-center gap-0.5">
+                      <button
+                        onClick={() => {
+                          if (!marked) {
+                            setCustomRange(null);
+                            setSelectedImport(prev => prev?.id === imp.id ? null : imp);
+                          }
+                        }}
+                        title={imp.filename}
+                        className={`px-3 py-1 rounded-full text-xs border transition-colors ${
+                          marked
+                            ? "border-red-400 text-red-400 line-through"
+                            : selectedImport?.id === imp.id
+                            ? "bg-primary text-primary-foreground border-primary"
+                            : "border-border text-muted-foreground hover:border-primary/50 hover:text-foreground"
+                        }`}
+                      >
+                        {formatPeriod(imp.period_from, imp.period_to)}
+                      </button>
+                      <button
+                        onClick={() => toggleDeleteSelection(imp.id)}
+                        title={marked ? "Снять отметку" : "Отметить для удаления"}
+                        className={`p-1 transition-colors ${marked ? "text-red-400" : "text-muted-foreground/50 hover:text-red-400"}`}
+                      >
+                        <Trash2 className="h-3 w-3" />
+                      </button>
+                    </div>
+                  );
+                })}
+                {deleteSelection.size > 0 && (
+                  <button
+                    onClick={() => setConfirmBulkDelete(true)}
+                    className="px-3 py-1 rounded-full text-xs border border-red-400 text-red-400 hover:bg-red-400/10 transition-colors"
+                  >
+                    Удалить ({deleteSelection.size})
+                  </button>
+                )}
+              </div>
+            )}
+          </div>
 
           {filtered.length === 0 && !loading ? (
             <div className="flex flex-col items-center justify-center h-96 gap-4 rounded-2xl border border-dashed border-border">
@@ -207,7 +293,14 @@ export default function App() {
 
               <DailyArea transactions={filtered} />
 
-              <TransactionTable transactions={filtered} categories={categories} />
+              <TransactionTable
+                transactions={filtered}
+                categories={categories}
+                onDelete={async (id) => {
+                  await invoke("delete_transaction", { id });
+                  load();
+                }}
+              />
             </>
           )}
         </div>
@@ -227,6 +320,32 @@ export default function App() {
           onComplete={onImportComplete}
           onClose={() => setShowWizard(false)}
         />
+      )}
+
+      {confirmBulkDelete && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-background/60 backdrop-blur-sm">
+          <div className="bg-card border border-border rounded-xl shadow-xl p-6 w-80 space-y-4">
+            <h3 className="font-semibold text-sm">Удалить {deleteSelection.size} {deleteSelection.size === 1 ? "импорт" : "импорта"}?</h3>
+            <p className="text-xs text-muted-foreground">
+              Все транзакции из отмеченных выписок будут удалены. Это действие нельзя отменить.
+            </p>
+            <div className="flex gap-2 justify-end">
+              <button
+                onClick={() => setConfirmBulkDelete(false)}
+                className="px-3 py-1.5 text-xs rounded-lg border border-border hover:bg-accent transition-colors"
+              >
+                Отмена
+              </button>
+              <button
+                onClick={handleBulkDelete}
+                disabled={bulkDeleting}
+                className="px-3 py-1.5 text-xs rounded-lg bg-red-500 text-white hover:bg-red-600 disabled:opacity-50 transition-colors"
+              >
+                {bulkDeleting ? "Удаляем..." : `Удалить (${deleteSelection.size})`}
+              </button>
+            </div>
+          </div>
+        </div>
       )}
     </div>
   );

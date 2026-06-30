@@ -3,9 +3,10 @@ use std::path::Path;
 use std::sync::Mutex;
 use tauri::{AppHandle, Emitter, State};
 
-use crate::categorizer::{categorize_one, CategorizedTx};
-use crate::db::{self, Category, Import, Settings, Transaction};
-use crate::importer::{filter_new, parse_xls};
+use crate::categorizer::CategorizedTx;
+use crate::db::{self, Category, Import, MerchantCache, Settings, Transaction};
+use crate::importer::{filter_new, parse_xls, tx_hash};
+use crate::pdf_parser::{ConfirmedPdfRow, ParsedPdf};
 use crate::normalizer::MerchantIndex;
 
 pub struct AppState(pub Mutex<rusqlite::Connection>);
@@ -189,6 +190,65 @@ pub async fn ping_ollama(endpoint: String) -> bool {
     ).await.map(|r| r.is_ok()).unwrap_or(false)
 }
 
+// ─── Mutations ────────────────────────────────────────────────────────────────
+
+#[tauri::command]
+pub fn delete_transaction(id: i64, state: State<AppState>) -> Result<(), String> {
+    let conn = state.0.lock().map_err(|e| e.to_string())?;
+    db::delete_transaction(&conn, id).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub fn delete_import(import_id: i64, state: State<AppState>) -> Result<usize, String> {
+    let conn = state.0.lock().map_err(|e| e.to_string())?;
+    db::delete_import(&conn, import_id).map_err(|e| e.to_string())
+}
+
+// ─── PDF Import ───────────────────────────────────────────────────────────────
+
+#[tauri::command]
+pub fn parse_pdf_preview(path: String) -> Result<ParsedPdf, String> {
+    crate::pdf_parser::parse_sovkombank_pdf(&path).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub fn pdf_rows_to_transactions(
+    rows: Vec<ConfirmedPdfRow>,
+    state: State<AppState>,
+) -> Result<ParseResult, String> {
+    let all: Vec<Transaction> = rows
+        .into_iter()
+        .map(|r| {
+            let merchant_key = if r.is_income {
+                "Доход".to_string()
+            } else {
+                crate::normalizer::normalize_merchant(&r.description)
+            };
+            let tx_hash = tx_hash(&r.date, r.amount, &r.description);
+            Transaction {
+                id: None,
+                import_id: None,
+                date: r.date,
+                amount: r.amount,
+                description: r.description,
+                merchant_key,
+                category: if r.is_income { "Доход".to_string() } else { String::new() },
+                tx_hash,
+                is_income: r.is_income,
+            }
+        })
+        .collect();
+
+    let conn = state.0.lock().map_err(|e| e.to_string())?;
+    let hashes = db::known_hashes(&conn).map_err(|e| e.to_string())?;
+    drop(conn);
+
+    let total_count = all.len();
+    let new_txs = filter_new(all, &hashes);
+    let new_count = new_txs.len();
+    Ok(ParseResult { new_count, total_count, transactions: new_txs })
+}
+
 // ─── AI Chat ──────────────────────────────────────────────────────────────────
 
 #[derive(Deserialize, Clone)]
@@ -215,7 +275,7 @@ fn ollama_tools() -> serde_json::Value {
             "type": "function",
             "function": {
                 "name": "get_spending_summary",
-                "description": "Возвращает итого расходов, доходов и количество транзакций за указанный период",
+                "description": "Возвращает итого расходов, доходов и количество транзакций за указанный период. Поля: total_expense (сумма расходов), days_in_period (точное количество дней в периоде), daily_avg (среднедневной расход), monthly_projection (прогноз расходов на 30 дней на основе daily_avg). ИСПОЛЬЗУЙ monthly_projection для оценки месячных расходов — не считай самостоятельно.",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -338,7 +398,9 @@ pub async fn chat_with_ai(
          2. Используй только даты из этого реального периода в последующих запросах.\n\
          3. После получения нужных данных — сразу давай конкретный ответ, не вызывай лишних инструментов.\n\
          4. Отвечай на русском языке. Суммы в рублях (₽).\n\
-         5. Будь конкретен: называй точные цифры из данных.",
+         5. Будь конкретен: называй точные цифры из данных.\n\
+         6. ВАЖНО для оценки месячных расходов: используй поле monthly_projection из get_spending_summary — это готовый прогноз на месяц. НЕ вычисляй его самостоятельно.\n\
+         7. Всегда указывай точное количество дней анализа (поле days_in_period) чтобы пользователь понимал на каком периоде основана оценка.",
         today
     );
 
@@ -493,49 +555,180 @@ pub struct ProgressEvent {
 }
 
 #[tauri::command]
-pub fn categorize_transactions(
+pub async fn categorize_transactions(
     transactions: Vec<Transaction>,
     app: AppHandle,
     state: State<'_, AppState>,
 ) -> Result<Vec<CategorizedTx>, String> {
-    let conn = state.0.lock().map_err(|e| e.to_string())?;
-    let categories: Vec<String> = db::get_categories(&conn)
-        .map_err(|e| e.to_string())?
-        .into_iter()
-        .map(|c| c.name)
-        .collect();
-    let known_keys = db::known_merchant_keys(&conn).map_err(|e| e.to_string())?;
-    drop(conn);
+    use std::collections::HashMap;
+    use std::sync::Arc;
 
+    let categories: Vec<String> = {
+        let conn = state.0.lock().map_err(|e| e.to_string())?;
+        db::get_categories(&conn).map_err(|e| e.to_string())?.into_iter().map(|c| c.name).collect()
+    };
+    let known_keys = {
+        let conn = state.0.lock().map_err(|e| e.to_string())?;
+        db::known_merchant_keys(&conn).map_err(|e| e.to_string())?
+    };
     let settings = {
         let conn = state.0.lock().map_err(|e| e.to_string())?;
         db::get_settings(&conn).map_err(|e| e.to_string())?
     };
 
     let total = transactions.len();
-    let mut results = Vec::new();
+    let mut results: Vec<Option<CategorizedTx>> = vec![None; total];
+    // mk → (sample tx for description, all indices sharing this mk)
+    let mut llm_queue: HashMap<String, (Transaction, Vec<usize>)> = HashMap::new();
     let mut merchant_index = MerchantIndex::new(known_keys);
 
+    // ── Pass 1: keyword / MCC / cache — sequential, no network ───────────────
     for (i, tx) in transactions.iter().enumerate() {
-        let conn = state.0.lock().map_err(|e| e.to_string())?;
-        let categorized = categorize_one(tx, &conn, &categories, &mut merchant_index,
-            &settings.endpoint, &settings.api_key, &settings.model)
-            .map_err(|e| e.to_string())?;
-        drop(conn);
+        if tx.is_income {
+            results[i] = Some(CategorizedTx {
+                tx: tx.clone(), source: "keyword".to_string(),
+                confidence: Some(1.0), reasoning: None,
+            });
+            continue;
+        }
+        let mk = merchant_index.resolve(&tx.merchant_key);
 
-        let _ = app.emit("categorize-progress", ProgressEvent {
-            merchant_key: categorized.tx.merchant_key.clone(),
-            category: categorized.tx.category.clone(),
-            source: categorized.source.clone(),
-            confidence: categorized.confidence,
-            done: i + 1,
-            total,
-        });
-
-        results.push(categorized);
+        if let Some(cat) = crate::categorizer::keyword_match(&mk, &tx.description) {
+            {
+                let conn = state.0.lock().map_err(|e| e.to_string())?;
+                db::upsert_merchant(&conn, &MerchantCache {
+                    merchant_key: mk.clone(), category: cat.clone(),
+                    source: "keyword".to_string(), confidence: Some(1.0),
+                    reasoning: Some("keyword match".to_string()),
+                }).ok();
+            }
+            results[i] = Some(CategorizedTx {
+                tx: Transaction { merchant_key: mk, category: cat, ..tx.clone() },
+                source: "keyword".to_string(), confidence: Some(1.0),
+                reasoning: Some("keyword match".to_string()),
+            });
+        } else if let Some(cat) = crate::categorizer::mcc_match(&tx.description) {
+            {
+                let conn = state.0.lock().map_err(|e| e.to_string())?;
+                db::upsert_merchant(&conn, &MerchantCache {
+                    merchant_key: mk.clone(), category: cat.clone(),
+                    source: "mcc".to_string(), confidence: Some(0.95), reasoning: None,
+                }).ok();
+            }
+            results[i] = Some(CategorizedTx {
+                tx: Transaction { merchant_key: mk, category: cat, ..tx.clone() },
+                source: "mcc".to_string(), confidence: Some(0.95), reasoning: None,
+            });
+        } else {
+            let cached = {
+                let conn = state.0.lock().map_err(|e| e.to_string())?;
+                db::cache_lookup(&conn, &mk).map_err(|e| e.to_string())?
+            };
+            if let Some(c) = cached {
+                results[i] = Some(CategorizedTx {
+                    tx: Transaction { merchant_key: mk, category: c.category.clone(), ..tx.clone() },
+                    source: c.source, confidence: c.confidence, reasoning: c.reasoning,
+                });
+            } else {
+                // Queue for LLM — deduplicated: one LLM call per unique merchant_key
+                let entry = llm_queue.entry(mk.clone()).or_insert_with(|| (tx.clone(), vec![]));
+                entry.1.push(i);
+            }
+        }
     }
 
-    Ok(results)
+    let p1_done = results.iter().filter(|r| r.is_some()).count();
+    let _ = app.emit("categorize-progress", ProgressEvent {
+        merchant_key: String::new(), category: String::new(),
+        source: "cache".to_string(), confidence: None,
+        done: p1_done, total,
+    });
+
+    // ── Pass 2: parallel LLM, max 4 concurrent, 1 call per unique merchant ───
+    if !llm_queue.is_empty() {
+        let sem  = Arc::new(tokio::sync::Semaphore::new(4));
+        let cats = Arc::new(categories);
+        let ep   = Arc::new(settings.endpoint);
+        let ak   = Arc::new(settings.api_key);
+        let md   = Arc::new(settings.model);
+
+        let mut join_set: tokio::task::JoinSet<(
+            String, Transaction, Vec<usize>,
+            anyhow::Result<crate::categorizer::OllamaLlmResponse>,
+        )> = tokio::task::JoinSet::new();
+
+        let llm_total = llm_queue.len();
+        for (mk, (tx, indices)) in llm_queue {
+            let sem  = sem.clone();
+            let cats = cats.clone();
+            let ep   = ep.clone();
+            let ak   = ak.clone();
+            let md   = md.clone();
+            let desc = tx.description.clone();
+            let mk2  = mk.clone();
+            join_set.spawn(async move {
+                let _permit = sem.acquire_owned().await.unwrap();
+                let result = crate::categorizer::llm_classify_async(
+                    &desc, &mk2, &cats, &ep, &ak, &md,
+                ).await;
+                (mk2, tx, indices, result)
+            });
+        }
+
+        let mut llm_done = 0_usize;
+
+        while let Some(join_result) = join_set.join_next().await {
+            let (mk, tx, indices, llm_result) = join_result.map_err(|e| e.to_string())?;
+            llm_done += 1;
+
+            let (category, confidence, reasoning) = match llm_result {
+                Ok(r) => {
+                    let cat = if cats.contains(&r.category) { r.category } else { "Прочее".to_string() };
+                    (cat, Some(r.confidence), Some(r.reasoning))
+                }
+                Err(e) => {
+                    eprintln!("[LLM] error for {mk}: {e}");
+                    ("Прочее".to_string(), Some(0.0), Some("ошибка классификации".to_string()))
+                }
+            };
+
+            {
+                let conn = state.0.lock().map_err(|e| e.to_string())?;
+                db::upsert_merchant(&conn, &MerchantCache {
+                    merchant_key: mk.clone(), category: category.clone(),
+                    source: "llm".to_string(), confidence, reasoning: reasoning.clone(),
+                }).ok();
+            }
+
+            for &i in &indices {
+                results[i] = Some(CategorizedTx {
+                    tx: Transaction { merchant_key: mk.clone(), category: category.clone(), ..tx.clone() },
+                    source: "llm".to_string(), confidence, reasoning: reasoning.clone(),
+                });
+            }
+
+            let _ = app.emit("categorize-progress", ProgressEvent {
+                merchant_key: mk.clone(), category: category.clone(),
+                source: "llm".to_string(), confidence,
+                done: p1_done + llm_done,
+                total: p1_done + llm_total,
+            });
+        } // while join_set
+    }
+
+    let _ = app.emit("categorize-progress", ProgressEvent {
+        merchant_key: String::new(), category: String::new(),
+        source: "done".to_string(), confidence: None, done: total, total,
+    });
+
+    let final_results = results.into_iter().enumerate().map(|(i, r)| {
+        r.unwrap_or_else(|| CategorizedTx {
+            tx: transactions[i].clone(),
+            source: "error".to_string(), confidence: Some(0.0), reasoning: None,
+        })
+    }).collect();
+
+    Ok(final_results)
 }
 
 #[derive(Deserialize)]
@@ -550,6 +743,7 @@ pub struct ApprovedTx {
 pub fn commit_import(
     filename: String,
     approved: Vec<ApprovedTx>,
+    balance: Option<f64>,
     state: State<AppState>,
 ) -> Result<usize, String> {
     let conn = state.0.lock().map_err(|e| e.to_string())?;
@@ -559,21 +753,19 @@ pub fn commit_import(
     let period_from = dates.iter().min().copied().unwrap_or("");
     let period_to = dates.iter().max().copied().unwrap_or("");
 
-    // Обновить merchant_cache для user-правок
     for a in &approved {
         if a.source == "user" {
-            let mc = db::MerchantCache {
+            db::upsert_merchant(&conn, &db::MerchantCache {
                 merchant_key: a.tx.merchant_key.clone(),
                 category: a.tx.category.clone(),
                 source: "user".to_string(),
                 confidence: None,
                 reasoning: None,
-            };
-            db::upsert_merchant(&conn, &mc).ok();
+            }).ok();
         }
     }
 
-    let import_id = db::create_import(&conn, &filename, period_from, period_to)
+    let import_id = db::create_import(&conn, &filename, period_from, period_to, balance)
         .map_err(|e| e.to_string())?;
     db::commit_transactions(&conn, import_id, &txs).map_err(|e| e.to_string())
 }
