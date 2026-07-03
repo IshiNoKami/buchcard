@@ -6,19 +6,6 @@ use std::path::Path;
 use crate::db::Transaction;
 use crate::normalizer::normalize_merchant;
 
-const INTERNAL_KEYWORDS: &[&str] = &[
-    "перевод собственных средств",
-    "зачисление перевода денежных средств",
-    "заработная плата",
-    "перевод со счета",
-    "перечисление на счет копилки путешествия по опции",
-];
-
-fn is_internal(desc: &str) -> bool {
-    let d = desc.to_lowercase();
-    INTERNAL_KEYWORDS.iter().any(|kw| d.contains(kw))
-}
-
 pub(crate) fn tx_hash(date: &str, amount: f64, description: &str) -> String {
     let prefix: String = description.chars().take(40).collect();
     let key = format!("{}|{}|{}", date, amount, prefix);
@@ -66,15 +53,20 @@ pub fn parse_xls(filepath: &Path) -> Result<Vec<Transaction>> {
         let description = row[ncols - 1].to_string().trim().to_string();
 
         if description.is_empty() { continue; }
-        if is_internal(&description) { continue; }
 
         let date = match parse_date(&date_raw) { Some(d) => d, None => continue };
-        let amount = match parse_amount(&amount_raw) { Some(a) => a, None => continue };
+        let amount_raw_val = match parse_amount(&amount_raw) { Some(a) => a, None => continue };
 
-        if amount >= 0.0 { continue; } // только расходы
-        let amount = -amount;
+        if amount_raw_val == 0.0 { continue; }
 
-        let merchant_key = normalize_merchant(&description);
+        let is_income = amount_raw_val > 0.0;
+        let amount = amount_raw_val.abs();
+
+        let merchant_key = if is_income {
+            "Доход".to_string()
+        } else {
+            normalize_merchant(&description)
+        };
         let hash = tx_hash(&date, amount, &description);
 
         rows.push(Transaction {
@@ -84,9 +76,9 @@ pub fn parse_xls(filepath: &Path) -> Result<Vec<Transaction>> {
             amount,
             description,
             merchant_key,
-            category: String::new(),
+            category: if is_income { "Доход".to_string() } else { String::new() },
             tx_hash: hash,
-            is_income: false,
+            is_income,
         });
     }
 

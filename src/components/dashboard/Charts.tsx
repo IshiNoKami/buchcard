@@ -1,6 +1,8 @@
+import { useState } from "react";
 import { Transaction, Category } from "@/lib/types";
 import { formatCurrency } from "@/lib/utils";
 import { useChartColors } from "@/lib/theme";
+import { X } from "lucide-react";
 import {
   PieChart, Pie, Cell, Tooltip, ResponsiveContainer,
   BarChart, Bar, XAxis, YAxis, CartesianGrid,
@@ -18,12 +20,15 @@ const colorMap = (cats: Category[]) =>
 export function SpendingPie({ transactions, categories }: Props) {
   const colors = colorMap(categories);
   const c = useChartColors();
+  const [selectedCategory, setSelectedCategory] = useState<string | null>(null);
 
   const data = Object.entries(
-    transactions.reduce<Record<string, number>>((acc, t) => {
-      acc[t.category] = (acc[t.category] || 0) + t.amount;
-      return acc;
-    }, {})
+    transactions
+      .filter((t) => !t.is_income)
+      .reduce<Record<string, number>>((acc, t) => {
+        acc[t.category] = (acc[t.category] || 0) + t.amount;
+        return acc;
+      }, {})
   )
     .map(([name, value]) => ({ name, value }))
     .sort((a, b) => b.value - a.value);
@@ -35,6 +40,22 @@ export function SpendingPie({ transactions, categories }: Props) {
     fontSize: 12,
     color: c.tooltipText,
   };
+
+  const drillDownMerchants = selectedCategory
+    ? Object.entries(
+        transactions
+          .filter(tx => tx.category === selectedCategory)
+          .reduce<Record<string, number>>((acc, tx) => {
+            const key = tx.merchant_key || tx.description;
+            acc[key] = (acc[key] || 0) + tx.amount;
+            return acc;
+          }, {})
+      )
+        .map(([name, total]) => ({ name, total }))
+        .sort((a, b) => b.total - a.total)
+    : [];
+
+  const drillDownTotal = drillDownMerchants.reduce((s, m) => s + m.total, 0);
 
   return (
     <div className="rounded-xl border border-border bg-card p-4">
@@ -49,6 +70,8 @@ export function SpendingPie({ transactions, categories }: Props) {
             outerRadius={105}
             paddingAngle={2}
             dataKey="value"
+            onClick={(entry: { name: string }) => setSelectedCategory(entry.name)}
+            style={{ cursor: "pointer" }}
           >
             {data.map((entry) => (
               <Cell key={entry.name} fill={colors[entry.name] ?? "#9E9E9E"} />
@@ -64,12 +87,65 @@ export function SpendingPie({ transactions, categories }: Props) {
       </ResponsiveContainer>
       <div className="mt-2 flex flex-wrap gap-x-3 gap-y-1">
         {data.slice(0, 6).map((d) => (
-          <span key={d.name} className="flex items-center gap-1 text-xs text-muted-foreground">
-            <span className="h-2 w-2 rounded-full" style={{ background: colors[d.name] ?? "#9E9E9E" }} />
+          <button
+            key={d.name}
+            onClick={() => setSelectedCategory(d.name)}
+            className="flex items-center gap-1 text-xs text-muted-foreground hover:text-foreground transition-colors"
+          >
+            <span className="h-2 w-2 rounded-full shrink-0" style={{ background: colors[d.name] ?? "#9E9E9E" }} />
             {d.name}
-          </span>
+          </button>
         ))}
       </div>
+
+      {selectedCategory && (
+        <div
+          className="fixed inset-0 z-50 flex items-center justify-center bg-background/70 backdrop-blur-sm"
+          onClick={() => setSelectedCategory(null)}
+        >
+          <div
+            className="bg-card border border-border rounded-2xl shadow-2xl w-80 max-h-[65vh] flex flex-col overflow-hidden"
+            onClick={e => e.stopPropagation()}
+          >
+            <div className="flex items-center justify-between px-5 py-4 border-b border-border shrink-0">
+              <div className="flex items-center gap-2 min-w-0">
+                <span
+                  className="h-3 w-3 rounded-full shrink-0"
+                  style={{ background: colors[selectedCategory] ?? "#9E9E9E" }}
+                />
+                <h3 className="text-sm font-semibold truncate">{selectedCategory}</h3>
+              </div>
+              <div className="flex items-center gap-2 ml-2 shrink-0">
+                <span className="text-sm font-bold text-muted-foreground">{formatCurrency(drillDownTotal)}</span>
+                <button
+                  onClick={() => setSelectedCategory(null)}
+                  className="h-6 w-6 flex items-center justify-center rounded-md hover:bg-accent transition-colors text-muted-foreground"
+                >
+                  <X className="h-3.5 w-3.5" />
+                </button>
+              </div>
+            </div>
+            <div className="overflow-y-auto flex-1 px-5 py-2">
+              {drillDownMerchants.length === 0 ? (
+                <p className="text-xs text-muted-foreground py-4 text-center">Нет данных</p>
+              ) : (
+                drillDownMerchants.map((m, i) => (
+                  <div
+                    key={m.name}
+                    className="flex items-center justify-between py-2 border-b border-border/40 last:border-0"
+                  >
+                    <div className="flex items-center gap-2 min-w-0">
+                      <span className="text-xs text-muted-foreground w-5 shrink-0">{i + 1}</span>
+                      <span className="text-sm text-foreground truncate">{m.name || "—"}</span>
+                    </div>
+                    <span className="text-sm font-medium ml-3 shrink-0">{formatCurrency(m.total)}</span>
+                  </div>
+                ))
+              )}
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }
@@ -82,12 +158,14 @@ export function TopMerchantsBar({ transactions }: { transactions: Transaction[] 
   const c = useChartColors();
 
   const data = Object.entries(
-    transactions.reduce<Record<string, number>>((acc, t) => {
-      const k = t.merchant_key.trim();
-      if (!k) return acc;
-      acc[k] = (acc[k] || 0) + t.amount;
-      return acc;
-    }, {})
+    transactions
+      .filter((t) => !t.is_income)
+      .reduce<Record<string, number>>((acc, t) => {
+        const k = t.merchant_key.trim();
+        if (!k) return acc;
+        acc[k] = (acc[k] || 0) + t.amount;
+        return acc;
+      }, {})
   )
     .map(([fullName, value]) => ({ fullName, value }))
     .sort((a, b) => b.value - a.value)
@@ -143,10 +221,12 @@ export function TopMerchantsBar({ transactions }: { transactions: Transaction[] 
 export function DailyArea({ transactions }: { transactions: Transaction[] }) {
   const c = useChartColors();
 
-  const byDate = transactions.reduce<Record<string, number>>((acc, t) => {
-    acc[t.date] = (acc[t.date] || 0) + t.amount;
-    return acc;
-  }, {});
+  const byDate = transactions
+    .filter((t) => !t.is_income)
+    .reduce<Record<string, number>>((acc, t) => {
+      acc[t.date] = (acc[t.date] || 0) + t.amount;
+      return acc;
+    }, {});
 
   const data = Object.entries(byDate)
     .sort((a, b) => a[0].localeCompare(b[0]))
@@ -194,6 +274,7 @@ export function DailyArea({ transactions }: { transactions: Transaction[] }) {
             labelStyle={{ color: c.tooltipMuted }}
           />
           <Area
+            name="Расходы"
             type="monotone" dataKey="amount"
             stroke={c.primary} strokeWidth={2}
             fill="url(#areaGrad)" dot={false} activeDot={{ r: 4 }}

@@ -88,7 +88,16 @@ pub fn normalize_merchant(raw: &str) -> String {
     if result.len() < 3 {
         let raw_clean = re_non.replace_all(&raw_lower, " ");
         let raw_clean = re_sp.replace_all(raw_clean.trim(), " ");
-        return raw_clean.split_whitespace().take(5).collect::<Vec<_>>().join(" ");
+        let fallback = raw_clean.split_whitespace().take(5).collect::<Vec<_>>().join(" ");
+        // If the original was pure digits (card number, account), keep it as-is to avoid empty key
+        if fallback.is_empty() {
+            let digits_only: String = raw.chars().filter(|c| c.is_ascii_digit()).collect();
+            if !digits_only.is_empty() {
+                return format!("card {}", &digits_only[..digits_only.len().min(8)]);
+            }
+            return "прочее".to_string();
+        }
+        return fallback;
     }
 
     result

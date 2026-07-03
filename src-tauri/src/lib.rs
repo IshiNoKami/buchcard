@@ -13,6 +13,8 @@ use std::sync::Mutex;
 pub fn run() {
     let conn = db::open().expect("Failed to open DB");
     db::init(&conn).expect("Failed to init DB");
+    db::init_goals(&conn).expect("Failed to init goals table");
+    db::init_kopilkas(&conn).expect("Failed to init kopilkas tables");
     db::renormalize_merchant_keys(&conn).ok();
 
     tauri::Builder::default()
@@ -24,12 +26,14 @@ pub fn run() {
             commands::get_categories,
             commands::get_imports,
             commands::add_category,
+            commands::set_category_excluded,
             commands::get_settings,
             commands::save_settings,
             commands::fetch_models,
             commands::start_ollama,
             commands::ping_ollama,
             commands::chat_with_ai,
+            commands::summarize_conversation,
             commands::parse_file,
             commands::categorize_transactions,
             commands::commit_import,
@@ -37,6 +41,14 @@ pub fn run() {
             commands::delete_import,
             commands::parse_pdf_preview,
             commands::pdf_rows_to_transactions,
+            commands::get_goals_with_progress,
+            commands::create_goal,
+            commands::delete_goal,
+            commands::update_goal,
+            commands::get_kopilkas,
+            commands::create_kopilka,
+            commands::add_kopilka_alias,
+            commands::find_unmatched_kopilka_descriptions,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

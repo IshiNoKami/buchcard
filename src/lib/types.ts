@@ -13,6 +13,7 @@ export interface Transaction {
 export interface Category {
   name: string;
   color: string;
+  excluded?: boolean;
 }
 
 export interface CategorizedTx {
@@ -38,6 +39,7 @@ export interface Import {
   period_to: string;
   imported_at: string;
   balance?: number;
+  kopilka_id?: number | null;
 }
 
 export interface Settings {
@@ -48,6 +50,31 @@ export interface Settings {
   advance_amount?: number;
   salary_day?: number;
   salary_amount?: number;
+}
+
+export interface Goal {
+  id: number;
+  name: string;
+  goal_type: 'limit' | 'save';
+  category: string;
+  budget: number;
+  date_from: string;
+  date_to: string;
+  created_at: string;
+  kopilka_id?: number | null;
+  manual_spent?: number | null;
+}
+
+export interface Kopilka {
+  id: number;
+  name: string;
+  aliases: string[];
+}
+
+export interface GoalProgress {
+  goal: Goal;
+  spent: number;
+  pct: number;
 }
 
 export interface ParseResult {

@@ -4,6 +4,9 @@ import { X, RefreshCw, Eye, EyeOff, Check, Play } from "lucide-react";
 import { Button } from "./ui/button";
 import { useTheme, THEMES, Theme } from "../lib/theme";
 import { Settings } from "../lib/types";
+import { getPaidModels, clearPaidModels } from "../lib/paidModels";
+
+const CLOUD_PREFERRED = ["minimax-m3:cloud", "nemotron-3-super"];
 
 const DAYS_RU = ["вс", "пн", "вт", "ср", "чт", "пт", "сб"];
 const MONTHS_RU = ["янв", "фев", "мар", "апр", "май", "июн", "июл", "авг", "сен", "окт", "ноя", "дек"];
@@ -55,6 +58,8 @@ export function SettingsPanel({ onClose }: Props) {
     salary_amount: undefined,
   });
   const [models, setModels] = useState<string[]>([]);
+  const [paidModels, setPaidModels] = useState<string[]>(() => getPaidModels());
+  const [showAllModels, setShowAllModels] = useState(false);
   const [loadingModels, setLoadingModels] = useState(false);
   const [modelsError, setModelsError] = useState("");
   const [showKey, setShowKey] = useState(false);
@@ -74,9 +79,14 @@ export function SettingsPanel({ onClose }: Props) {
         endpoint: settings.endpoint,
         apiKey: settings.api_key,
       });
-      setModels(list.map(m => m.name));
-      if (list.length > 0 && !list.find(m => m.name === settings.model)) {
-        setSettings(s => ({ ...s, model: list[0].name }));
+      const names = list.map(m => m.name);
+      setModels(names);
+      // If the current model is missing or known-paid, switch to the first free one.
+      const paid = getPaidModels();
+      const freeNames = names.filter(n => !paid.includes(n));
+      const currentOk = names.includes(settings.model) && !paid.includes(settings.model);
+      if (names.length > 0 && !currentOk) {
+        setSettings(s => ({ ...s, model: freeNames[0] ?? names[0] }));
       }
     } catch (e) {
       setModelsError(String(e));
@@ -126,6 +136,11 @@ export function SettingsPanel({ onClose }: Props) {
   }
 
   const isCloud = settings.endpoint.includes("ollama.com");
+  const freeCloudModels = models.filter(m => !paidModels.includes(m));
+  const visibleModels = isCloud && !showAllModels
+    ? [...CLOUD_PREFERRED.filter(p => freeCloudModels.includes(p)), ...freeCloudModels.filter(m => !CLOUD_PREFERRED.includes(m))]
+    : models;
+  const hiddenPaidCount = isCloud ? models.filter(m => paidModels.includes(m)).length : 0;
 
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-background/80 backdrop-blur-sm">
@@ -282,7 +297,7 @@ export function SettingsPanel({ onClose }: Props) {
                     {models.length === 0 && (
                       <option value={settings.model}>{settings.model}</option>
                     )}
-                    {models.map(m => (
+                    {visibleModels.map(m => (
                       <option key={m} value={m}>{m}</option>
                     ))}
                   </select>
@@ -295,6 +310,26 @@ export function SettingsPanel({ onClose }: Props) {
                     <RefreshCw className={`h-4 w-4 ${loadingModels ? "animate-spin" : ""}`} />
                   </button>
                 </div>
+                {isCloud && hiddenPaidCount > 0 && (
+                  <div className="flex items-center gap-2 mt-1.5 text-xs text-muted-foreground">
+                    <span>Скрыто несовместимых: {hiddenPaidCount}</span>
+                    <button onClick={() => setShowAllModels(v => !v)} className="text-primary hover:underline">
+                      {showAllModels ? "скрыть" : "показать все"}
+                    </button>
+                    <span className="opacity-40">·</span>
+                    <button
+                      onClick={() => { clearPaidModels(); setPaidModels([]); }}
+                      className="text-primary hover:underline"
+                    >
+                      сбросить
+                    </button>
+                  </div>
+                )}
+                {isCloud && (
+                  <p className="text-[11px] text-muted-foreground/70 mt-1">
+                    Модели, которые не работают с ассистентом (платные или без поддержки инструментов), скрываются автоматически.
+                  </p>
+                )}
                 {modelsError && (
                   <div className="mt-1 rounded-lg bg-destructive/10 border border-destructive/20 px-3 py-2 space-y-2">
                     <p className="text-xs text-destructive">{modelsError}</p>

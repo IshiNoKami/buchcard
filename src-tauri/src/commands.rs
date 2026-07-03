@@ -37,6 +37,12 @@ pub fn add_category(name: String, color: String, state: State<AppState>) -> Resu
     db::add_category(&conn, &name, &color).map_err(|e| e.to_string())
 }
 
+#[tauri::command]
+pub fn set_category_excluded(name: String, excluded: bool, state: State<AppState>) -> Result<(), String> {
+    let conn = state.0.lock().map_err(|e| e.to_string())?;
+    db::set_category_excluded(&conn, &name, excluded).map_err(|e| e.to_string())
+}
+
 // ─── Settings ─────────────────────────────────────────────────────────────────
 
 #[tauri::command]
@@ -173,21 +179,37 @@ pub fn start_ollama() -> Result<String, String> {
     }
 }
 
-// TCP ping to check if Ollama port is open — uses explicit 127.0.0.1 to avoid
-// IPv6 resolution of "localhost" when Ollama only binds to IPv4
+// Reachability check for Ollama. Local endpoints use a fast TCP probe on
+// 127.0.0.1 (avoids IPv6 "localhost" resolution issues). Remote/cloud endpoints
+// (e.g. https://ollama.com) can't be TCP-pinged on localhost, so we do a short
+// HTTP probe instead — any HTTP response means the server is reachable.
 #[tauri::command]
 pub async fn ping_ollama(endpoint: String) -> bool {
-    let port: u16 = endpoint
-        .trim_end_matches('/')
-        .rsplit(':')
-        .next()
-        .and_then(|p| p.parse().ok())
-        .unwrap_or(11434);
-    let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
-    tokio::time::timeout(
-        std::time::Duration::from_secs(2),
-        tokio::net::TcpStream::connect(addr),
-    ).await.map(|r| r.is_ok()).unwrap_or(false)
+    let ep = endpoint.trim_end_matches('/').to_string();
+    let is_local = ep.contains("localhost") || ep.contains("127.0.0.1");
+
+    if is_local {
+        let port: u16 = ep
+            .rsplit(':')
+            .next()
+            .and_then(|p| p.parse().ok())
+            .unwrap_or(11434);
+        let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
+        return tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            tokio::net::TcpStream::connect(addr),
+        ).await.map(|r| r.is_ok()).unwrap_or(false);
+    }
+
+    // Remote / cloud: HTTP probe. Even a 401/403 proves the host answers.
+    let url = format!("{}/api/version", ep);
+    match reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(4))
+        .build()
+    {
+        Ok(client) => client.get(&url).send().await.is_ok(),
+        Err(_) => false,
+    }
 }
 
 // ─── Mutations ────────────────────────────────────────────────────────────────
@@ -274,15 +296,53 @@ fn ollama_tools() -> serde_json::Value {
         {
             "type": "function",
             "function": {
+                "name": "resolve_period",
+                "description": "Превращает словесный период в точные даты from_date/to_date. ВСЕГДА используй этот инструмент вместо самостоятельного вычисления дат. Не считай даты в уме.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "period": {
+                            "type": "string",
+                            "enum": ["this_month", "last_month", "last_7_days", "last_30_days", "last_90_days", "this_year", "last_year", "last_n_months", "all"],
+                            "description": "Словесный период: this_month=текущий месяц, last_month=прошлый месяц, last_7_days/last_30_days/last_90_days=последние N дней, this_year=текущий год, last_year=прошлый год, last_n_months=последние n месяцев (укажи n), all=весь период"
+                        },
+                        "n": { "type": "integer", "description": "Число месяцев для last_n_months (например 3)" }
+                    },
+                    "required": ["period"]
+                }
+            }
+        },
+        {
+            "type": "function",
+            "function": {
                 "name": "get_spending_summary",
-                "description": "Возвращает итого расходов, доходов и количество транзакций за указанный период. Поля: total_expense (сумма расходов), days_in_period (точное количество дней в периоде), daily_avg (среднедневной расход), monthly_projection (прогноз расходов на 30 дней на основе daily_avg). ИСПОЛЬЗУЙ monthly_projection для оценки месячных расходов — не считай самостоятельно.",
+                "description": "Возвращает итого расходов, доходов и количество транзакций за период. Поля: total_expense (сумма расходов), total_income (сумма доходов), net (доход минус расход), days_in_period (точное число дней), daily_avg (среднедневной расход), monthly_projection (готовый прогноз расходов на 30 дней). ИСПОЛЬЗУЙ monthly_projection для оценки месячных расходов — НЕ считай сам. Можно передать category чтобы получить эти же цифры по одной категории.",
                 "parameters": {
                     "type": "object",
                     "properties": {
                         "from_date": { "type": "string", "description": "Начало периода YYYY-MM-DD" },
-                        "to_date":   { "type": "string", "description": "Конец периода YYYY-MM-DD" }
+                        "to_date":   { "type": "string", "description": "Конец периода YYYY-MM-DD" },
+                        "category":  { "type": "string", "description": "Необязательно: название категории для фильтра (например 'Кафе/Рестораны')" }
                     },
                     "required": ["from_date", "to_date"]
+                }
+            }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "compare_periods",
+                "description": "Сравнивает расходы за два периода и возвращает готовую разницу. Поля результата: period_a, period_b (полные summary), delta_expense (period_b минус period_a), pct_change (% изменения). Используй когда нужно сравнить 'этот месяц с прошлым' и т.п. НЕ вычисляй разницу сам.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "from_a": { "type": "string", "description": "Начало периода A (более раннего) YYYY-MM-DD" },
+                        "to_a":   { "type": "string", "description": "Конец периода A YYYY-MM-DD" },
+                        "from_b": { "type": "string", "description": "Начало периода B (более позднего) YYYY-MM-DD" },
+                        "to_b":   { "type": "string", "description": "Конец периода B YYYY-MM-DD" },
+                        "category": { "type": "string", "description": "Необязательно: категория для сравнения" }
+                    },
+                    "required": ["from_a", "to_a", "from_b", "to_b"]
                 }
             }
         },
@@ -305,13 +365,52 @@ fn ollama_tools() -> serde_json::Value {
             "type": "function",
             "function": {
                 "name": "get_monthly_trends",
-                "description": "Возвращает динамику расходов и доходов по месяцам",
+                "description": "Возвращает помесячную динамику расходов (total_expense) и доходов (total_income) за указанный диапазон дат. Используй даты из get_data_period.",
                 "parameters": {
                     "type": "object",
                     "properties": {
-                        "months": { "type": "integer", "description": "Количество месяцев назад (например 6)" }
+                        "from_date": { "type": "string", "description": "Начало периода YYYY-MM-DD" },
+                        "to_date":   { "type": "string", "description": "Конец периода YYYY-MM-DD" }
                     },
-                    "required": ["months"]
+                    "required": ["from_date", "to_date"]
+                }
+            }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "propose_goal",
+                "description": "Предложить пользователю создать финансовую цель прямо в чате. Вызывай в двух случаях: (1) пользователь сам упоминает желание накопить или ограничить расходы; (2) анализ бюджета выявил категорию с высокими расходами, где разумное ограничение улучшит финансовое положение — тогда предложи цель сам, объяснив логику. Пользователь увидит карточку с кнопкой подтверждения и сможет принять или отклонить. Вызывай ПОСЛЕ получения данных — чтобы предложить реалистичную, обоснованную цифру, а не случайную.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "goal_type": {
+                            "type": "string",
+                            "enum": ["limit", "save"],
+                            "description": "limit = ограничение расходов по категории, save = цель накопления"
+                        },
+                        "name": {
+                            "type": "string",
+                            "description": "Краткое название цели, например 'Лимит на кафе' или 'Накопить на отпуск'"
+                        },
+                        "category": {
+                            "type": "string",
+                            "description": "Категория расходов (только для goal_type=limit). Используй точные названия категорий из get_category_breakdown."
+                        },
+                        "budget": {
+                            "type": "number",
+                            "description": "Сумма в рублях (лимит расходов или цель накопления)"
+                        },
+                        "date_from": {
+                            "type": "string",
+                            "description": "Дата начала цели YYYY-MM-DD"
+                        },
+                        "date_to": {
+                            "type": "string",
+                            "description": "Дата окончания цели YYYY-MM-DD"
+                        }
+                    },
+                    "required": ["goal_type", "name", "budget", "date_from", "date_to"]
                 }
             }
         },
@@ -334,9 +433,74 @@ fn ollama_tools() -> serde_json::Value {
     ])
 }
 
-fn execute_tool(name: &str, args: &serde_json::Value, conn: &rusqlite::Connection) -> String {
+/// Resolve a spoken period ("last_month", "this_year"…) into exact dates.
+/// Keeps all date math in Rust so the model never has to compute dates itself.
+fn resolve_period_dates(period: &str, n: i64, today: chrono::NaiveDate) -> (String, String, String) {
+    use chrono::{Datelike, Duration, Months};
+    let fmt = |d: chrono::NaiveDate| d.format("%Y-%m-%d").to_string();
+    match period {
+        "this_month" => {
+            let start = today.with_day(1).unwrap_or(today);
+            (fmt(start), fmt(today), "текущий месяц".into())
+        }
+        "last_month" => {
+            let first_this = today.with_day(1).unwrap_or(today);
+            let last_end = first_this - Duration::days(1);
+            let last_start = last_end.with_day(1).unwrap_or(last_end);
+            (fmt(last_start), fmt(last_end), "прошлый месяц".into())
+        }
+        "last_7_days"  => (fmt(today - Duration::days(6)),  fmt(today), "последние 7 дней".into()),
+        "last_30_days" => (fmt(today - Duration::days(29)), fmt(today), "последние 30 дней".into()),
+        "last_90_days" => (fmt(today - Duration::days(89)), fmt(today), "последние 90 дней".into()),
+        "this_year" => {
+            let start = chrono::NaiveDate::from_ymd_opt(today.year(), 1, 1).unwrap_or(today);
+            (fmt(start), fmt(today), "текущий год".into())
+        }
+        "last_year" => {
+            let start = chrono::NaiveDate::from_ymd_opt(today.year() - 1, 1, 1).unwrap_or(today);
+            let end   = chrono::NaiveDate::from_ymd_opt(today.year() - 1, 12, 31).unwrap_or(today);
+            (fmt(start), fmt(end), "прошлый год".into())
+        }
+        "last_n_months" => {
+            let months = n.clamp(1, 120) as u32;
+            let start = today.checked_sub_months(Months::new(months)).unwrap_or(today);
+            (fmt(start), fmt(today), format!("последние {} мес.", months))
+        }
+        _ => ("2000-01-01".into(), "2099-12-31".into(), "весь период".into()),
+    }
+}
+
+fn round1(x: f64) -> f64 { (x * 10.0).round() / 10.0 }
+
+#[derive(Clone, Serialize)]
+struct GoalProposal {
+    goal_type: String,
+    name: String,
+    category: Option<String>,
+    budget: f64,
+    date_from: String,
+    date_to: String,
+}
+
+/// Human-readable status shown in the chat UI while a given tool runs.
+fn tool_status(name: &str) -> &'static str {
+    match name {
+        "get_data_period"        => "Проверяю доступные данные…",
+        "resolve_period"         => "Определяю период…",
+        "get_spending_summary"   => "Считаю расходы…",
+        "get_category_breakdown" => "Разбираю траты по категориям…",
+        "get_top_merchants"      => "Ищу крупнейшие траты…",
+        "get_monthly_trends"     => "Смотрю динамику по месяцам…",
+        "compare_periods"        => "Сравниваю периоды…",
+        "propose_goal"           => "Формирую предложение цели…",
+        _                        => "Анализирую данные…",
+    }
+}
+
+fn execute_tool(name: &str, args: &serde_json::Value, conn: &rusqlite::Connection, app: &AppHandle) -> String {
     let from = args["from_date"].as_str().unwrap_or("2000-01-01");
     let to   = args["to_date"].as_str().unwrap_or("2099-12-31");
+    let category = args["category"].as_str().filter(|s| !s.is_empty());
 
     match name {
         "get_data_period" => {
@@ -345,10 +509,42 @@ fn execute_tool(name: &str, args: &serde_json::Value, conn: &rusqlite::Connectio
                 Err(e) => format!("{{\"error\": \"{}\"}}", e),
             }
         }
+        "resolve_period" => {
+            let period = args["period"].as_str().unwrap_or("all");
+            let n = args["n"].as_i64().unwrap_or(3);
+            let today = chrono::Local::now().date_naive();
+            let (f, t, label) = resolve_period_dates(period, n, today);
+            serde_json::json!({ "from_date": f, "to_date": t, "label": label }).to_string()
+        }
         "get_spending_summary" => {
-            match db::get_spending_summary(conn, from, to) {
+            match db::get_spending_summary(conn, from, to, category) {
                 Ok(s) => serde_json::to_string(&s).unwrap_or_default(),
                 Err(e) => format!("{{\"error\": \"{}\"}}", e),
+            }
+        }
+        "compare_periods" => {
+            let fa = args["from_a"].as_str().unwrap_or(from);
+            let ta = args["to_a"].as_str().unwrap_or(to);
+            let fb = args["from_b"].as_str().unwrap_or(from);
+            let tb = args["to_b"].as_str().unwrap_or(to);
+            match (
+                db::get_spending_summary(conn, fa, ta, category),
+                db::get_spending_summary(conn, fb, tb, category),
+            ) {
+                (Ok(a), Ok(b)) => {
+                    let delta_expense = ((b.total_expense - a.total_expense) * 100.0).round() / 100.0;
+                    let pct = if a.total_expense.abs() > 0.001 {
+                        round1((b.total_expense - a.total_expense) / a.total_expense * 100.0)
+                    } else { 0.0 };
+                    serde_json::json!({
+                        "period_a": a,
+                        "period_b": b,
+                        "delta_expense": delta_expense,
+                        "pct_change": pct,
+                        "note": "delta_expense = period_b.total_expense - period_a.total_expense; положительное = расходы выросли"
+                    }).to_string()
+                }
+                _ => "{\"error\": \"не удалось сравнить периоды\"}".to_string(),
             }
         }
         "get_category_breakdown" => {
@@ -358,8 +554,7 @@ fn execute_tool(name: &str, args: &serde_json::Value, conn: &rusqlite::Connectio
             }
         }
         "get_monthly_trends" => {
-            let months = args["months"].as_i64().unwrap_or(6);
-            match db::get_monthly_totals(conn, months) {
+            match db::get_monthly_totals(conn, from, to) {
                 Ok(v) => serde_json::to_string(&v).unwrap_or_default(),
                 Err(e) => format!("{{\"error\": \"{}\"}}", e),
             }
@@ -371,8 +566,70 @@ fn execute_tool(name: &str, args: &serde_json::Value, conn: &rusqlite::Connectio
                 Err(e) => format!("{{\"error\": \"{}\"}}", e),
             }
         }
+        "propose_goal" => {
+            let goal_type = args["goal_type"].as_str().unwrap_or("limit").to_string();
+            let name_val  = args["name"].as_str().unwrap_or("Новая цель").to_string();
+            let category  = args["category"].as_str().filter(|s| !s.is_empty()).map(|s| s.to_string());
+            let budget    = args["budget"].as_f64().unwrap_or(0.0);
+            let date_from = args["date_from"].as_str().unwrap_or("").to_string();
+            let date_to   = args["date_to"].as_str().unwrap_or("").to_string();
+            let _ = app.emit("chat-goal-proposal", GoalProposal {
+                goal_type, name: name_val, category, budget, date_from, date_to,
+            });
+            // Явно сигнализируем модели что инструмент выполнен и нужно дать финальный ответ,
+            // не вызывая больше никаких инструментов.
+            "{\"status\": \"proposal_sent\", \"instruction\": \"Карточка с предложением цели показана пользователю. Дай короткий финальный ответ (2-3 предложения) — подтверди что именно предложил и почему. Больше инструменты не вызывай.\"}".to_string()
+        }
         _ => format!("{{\"error\": \"unknown tool: {}\"}}", name),
     }
+}
+
+/// Fallback context window if we can't read the model's real one via /api/show.
+const DEFAULT_CTX: i64 = 8192;
+/// Cap for LOCAL models — a huge window blows up KV-cache VRAM on consumer GPUs.
+const LOCAL_CTX_CAP: i64 = 8192;
+/// Cap for CLOUD models — they run on Ollama's hardware, so we can allow more.
+const CLOUD_CTX_CAP: i64 = 32768;
+
+/// Read a model's real context length via /api/show. Ollama reports it under
+/// "model_info" as "<arch>.context_length" (e.g. "qwen2.context_length").
+async fn fetch_model_ctx(
+    client: &reqwest::Client,
+    base: &str,
+    model: &str,
+    auth: &Option<String>,
+) -> Option<i64> {
+    let url = format!("{}/api/show", base);
+    let mut req = client.post(&url).json(&serde_json::json!({ "name": model }));
+    if let Some(h) = auth { req = req.header("Authorization", h); }
+    let v: serde_json::Value = req.send().await.ok()?.json().await.ok()?;
+    let mi = v.get("model_info")?.as_object()?;
+    for (k, val) in mi {
+        if k.ends_with(".context_length") || k == "context_length" {
+            if let Some(n) = val.as_i64() {
+                return Some(n);
+            }
+        }
+    }
+    None
+}
+
+/// Context-window fill reported to the UI after each answer.
+#[derive(Serialize, Clone)]
+struct ContextUsage {
+    used: i64,
+    max: i64,
+}
+
+/// Mutable state accumulated while reading one streamed round from Ollama.
+#[derive(Default)]
+struct StreamRound {
+    content: String,
+    tool_calls: Vec<serde_json::Value>,
+    streamed_any: bool,
+    error: Option<String>,
+    prompt_tokens: i64,
+    eval_tokens: i64,
 }
 
 #[tauri::command]
@@ -392,15 +649,24 @@ pub async fn chat_with_ai(
     let today = chrono::Local::now().format("%Y-%m-%d").to_string();
     let system_content = format!(
         "Ты финансовый ассистент приложения Buchcard. Сегодня: {}.\n\
-         У тебя есть инструменты для чтения данных банковской выписки пользователя.\n\
-         Правила:\n\
-         1. ВСЕГДА начинай с вызова get_data_period — он покажет реальный период данных в базе.\n\
-         2. Используй только даты из этого реального периода в последующих запросах.\n\
-         3. После получения нужных данных — сразу давай конкретный ответ, не вызывай лишних инструментов.\n\
-         4. Отвечай на русском языке. Суммы в рублях (₽).\n\
-         5. Будь конкретен: называй точные цифры из данных.\n\
-         6. ВАЖНО для оценки месячных расходов: используй поле monthly_projection из get_spending_summary — это готовый прогноз на месяц. НЕ вычисляй его самостоятельно.\n\
-         7. Всегда указывай точное количество дней анализа (поле days_in_period) чтобы пользователь понимал на каком периоде основана оценка.",
+         У тебя есть инструменты для чтения данных банковской выписки. Все вычисления делают инструменты — твоя задача выбрать нужный и пересказать результат.\n\
+         \n\
+         СЕМАНТИКА ДАННЫХ:\n\
+         - Все суммы в рублях, положительные числа, уже округлены.\n\
+         - total_expense = сумма РАСХОДОВ (потраченные деньги, is_income=false).\n\
+         - total_income = сумма ДОХОДОВ (полученные деньги, is_income=true).\n\
+         - net = total_income - total_expense. net > 0 значит доходы больше расходов.\n\
+         - get_category_breakdown и get_top_merchants возвращают ТОЛЬКО расходы.\n\
+         - monthly_projection = готовый прогноз расходов на 30 дней.\n\
+         \n\
+         ЖЁСТКИЕ ПРАВИЛА (нарушение = ошибка):\n\
+         1. НИКОГДА не вычисляй даты в уме. Для любого словесного периода ('этот месяц', 'за год', 'последние 3 месяца') вызови resolve_period и возьми готовые from_date/to_date.\n\
+         2. НИКОГДА не считай суммы, разницы, проценты и проекции сам. Бери готовые поля из инструментов. Для сравнения периодов используй compare_periods (в нём есть delta_expense и pct_change).\n\
+         3. Первым делом вызови get_data_period чтобы понимать, за какой период вообще есть данные. Если пользователь просит период, где данных нет — честно скажи об этом.\n\
+         4. После получения нужных данных сразу давай ответ, без лишних вызовов.\n\
+         7. Если анализ показывает категорию с аномально высокими расходами (>30% бюджета или явный пик) — предложи конкретную цель-ограничение через propose_goal. Объясни кратко почему, затем вызови инструмент. Не создавай цели молча — сначала объясни, потом вызывай.\n\
+         5. Отвечай на русском, суммы в ₽. Называй точные цифры и указывай период анализа (days_in_period).\n\
+         6. Не путай расходы и доходы.",
         today
     );
 
@@ -422,6 +688,17 @@ pub async fn chat_with_ai(
         None
     };
 
+    // Use the model's REAL context window (capped for VRAM/perf) so the fill %
+    // is accurate. Local models are capped low to protect GPU memory; cloud
+    // models run remotely so we allow a larger window.
+    let base = endpoint.trim_end_matches('/').to_string();
+    let is_cloud = !endpoint.contains("127.0.0.1");
+    let ctx_cap = if is_cloud { CLOUD_CTX_CAP } else { LOCAL_CTX_CAP };
+    let effective_ctx = fetch_model_ctx(&client, &base, &settings.model, &auth_header)
+        .await
+        .unwrap_or(DEFAULT_CTX)
+        .clamp(2048, ctx_cap);
+
     let emit_err = |e: reqwest::Error| -> String {
         let s = e.to_string();
         if e.is_connect() || s.contains("10054") || s.contains("10061") || s.contains("refused") {
@@ -431,7 +708,12 @@ pub async fn chat_with_ai(
         }
     };
 
-    // Tool-calling loop — one call per round, stream: false to inspect tool_calls
+    use futures_util::StreamExt;
+
+    let _ = app.emit("chat-status", "Думаю…");
+
+    // Tool-calling loop. Every round streams (stream:true): content tokens are
+    // forwarded to the UI in real time, tool_calls are accumulated from the stream.
     for round in 0..8_usize {
         // After 5 rounds of tool calls, nudge model to stop calling tools and answer
         if round == 5 {
@@ -445,7 +727,12 @@ pub async fn chat_with_ai(
             "model": settings.model,
             "messages": ollama_msgs,
             "tools": ollama_tools(),
-            "stream": false
+            "stream": true,
+            // Ollama defaults num_ctx to ~4096. With the system prompt, 7 tool
+            // definitions, prior answers and tool results, a follow-up question
+            // easily overflows that and the model returns an empty response.
+            // effective_ctx = the model's real window, capped for VRAM/perf.
+            "options": { "num_ctx": effective_ctx }
         });
 
         let mut req = client.post(&url).json(&body);
@@ -460,46 +747,129 @@ pub async fn chat_with_ai(
             }
         };
 
-        let resp: serde_json::Value = match http_resp.json().await {
-            Ok(v) => v,
-            Err(e) => {
-                let _ = app.emit("chat-token", format!("Ошибка разбора ответа: {}", e));
-                let _ = app.emit("chat-done", "");
-                return Ok(());
+        // Read the newline-delimited JSON stream chunk by chunk.
+        // Buffer as raw bytes so multibyte UTF-8 (Cyrillic) is never split.
+        let mut stream = http_resp.bytes_stream();
+        let mut buf: Vec<u8> = Vec::new();
+        let mut round = StreamRound::default();
+
+        let handle_line = |line: &str, st: &mut StreamRound| {
+            let v: serde_json::Value = match serde_json::from_str(line) {
+                Ok(v) => v,
+                Err(_) => return,
+            };
+            // Ollama reports failures (e.g. context overflow) as a top-level "error".
+            if let Some(err) = v.get("error").and_then(|e| e.as_str()) {
+                st.error = Some(err.to_string());
+                return;
+            }
+            // Final chunk carries token accounting for the whole request.
+            if v.get("done").and_then(|d| d.as_bool()) == Some(true) {
+                if let Some(pe) = v.get("prompt_eval_count").and_then(|x| x.as_i64()) {
+                    st.prompt_tokens = pe;
+                }
+                if let Some(ec) = v.get("eval_count").and_then(|x| x.as_i64()) {
+                    st.eval_tokens = ec;
+                }
+            }
+            let msg = &v["message"];
+            if let Some(tc) = msg["tool_calls"].as_array() {
+                for t in tc { st.tool_calls.push(t.clone()); }
+            }
+            if let Some(content) = msg["content"].as_str() {
+                if !content.is_empty() {
+                    st.content.push_str(content);
+                    let _ = app.emit("chat-token", content);
+                    st.streamed_any = true;
+                }
             }
         };
 
-        let msg = &resp["message"];
-        let has_tool_calls = msg["tool_calls"].as_array()
-            .map(|a| !a.is_empty())
-            .unwrap_or(false);
-
-        if !has_tool_calls {
-            // Final answer — emit word by word for natural feel
-            let text = msg["content"].as_str().unwrap_or("").to_string();
-            if text.is_empty() {
-                let _ = app.emit("chat-token", "Не удалось сформировать ответ. Попробуйте ещё раз.");
-            } else {
-                for word in text.split_inclusive(' ') {
-                    let _ = app.emit("chat-token", word);
-                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        while let Some(chunk) = stream.next().await {
+            let bytes = match chunk {
+                Ok(b) => b,
+                Err(e) => {
+                    let _ = app.emit("chat-token", emit_err(e));
+                    let _ = app.emit("chat-done", "");
+                    return Ok(());
                 }
+            };
+            buf.extend_from_slice(&bytes);
+
+            while let Some(pos) = buf.iter().position(|&b| b == b'\n') {
+                let line_bytes: Vec<u8> = buf.drain(..=pos).collect();
+                let line = String::from_utf8_lossy(&line_bytes[..line_bytes.len() - 1]);
+                let line = line.trim();
+                if line.is_empty() { continue; }
+                handle_line(line, &mut round);
             }
+        }
+        // Trailing line without a final newline
+        let leftover = String::from_utf8_lossy(&buf);
+        let leftover = leftover.trim();
+        if !leftover.is_empty() {
+            handle_line(leftover, &mut round);
+        }
+
+        // Ollama returned an error mid-stream (e.g. context overflow, paid model).
+        if let Some(err) = round.error {
+            if round.streamed_any { let _ = app.emit("chat-reset", ""); }
+            let el = err.to_lowercase();
+            let no_tools = el.contains("does not support tools") || el.contains("support tools");
+            let is_paid = el.contains("subscription") || el.contains("upgrade")
+                || el.contains("requires a") || el.contains("paid");
+            let hint = if no_tools {
+                // Model can't do tool calling — useless for this assistant. Hide it.
+                let _ = app.emit("chat-model-unavailable", settings.model.clone());
+                "\n\nЭта модель не поддерживает инструменты (tool calling), а ассистенту они нужны, \
+                 чтобы читать твою выписку. Выбери модель с поддержкой инструментов — например \
+                 qwen2.5:14b, qwen3.5 или llama3.1. Модель скрыта из списка автоматически."
+            } else if is_paid {
+                // Tell the UI which model is paid so it can hide it from the list.
+                let _ = app.emit("chat-model-unavailable", settings.model.clone());
+                "\n\nЭта модель доступна только по платной подписке Ollama Cloud. \
+                 Выберите бесплатную модель в Настройках — платные скрыты из списка автоматически."
+            } else if el.contains("context") || el.contains("memory") || el.contains("ctx") {
+                " (переполнен контекст — начните новый диалог кнопкой очистки)"
+            } else {
+                ""
+            };
+            let _ = app.emit("chat-token", format!("⚠️ {}{}", err, hint));
             let _ = app.emit("chat-done", "");
             return Ok(());
         }
 
-        // Process tool calls
-        let tool_calls = msg["tool_calls"].as_array().unwrap().to_vec();
+        // No tool calls → this round WAS the final answer, already streamed live.
+        if round.tool_calls.is_empty() {
+            if !round.streamed_any {
+                let _ = app.emit("chat-token", "Не удалось сформировать ответ. Попробуйте ещё раз.");
+            }
+            // Report context fill so the UI can show it / trigger compaction.
+            let used = round.prompt_tokens + round.eval_tokens;
+            let _ = app.emit("chat-context", ContextUsage { used, max: effective_ctx });
+            let _ = app.emit("chat-done", "");
+            return Ok(());
+        }
+
+        // Tool calls present. If the model streamed interim "thinking" text before
+        // deciding to call a tool, tell the UI to discard it (it isn't the answer).
+        if round.streamed_any {
+            let _ = app.emit("chat-reset", "");
+        }
+
+        // Record the assistant turn (with its tool_calls) into the conversation.
+        let StreamRound { content: assistant_content, tool_calls, .. } = round;
         ollama_msgs.push(serde_json::json!({
             "role": "assistant",
-            "content": msg["content"].as_str().unwrap_or(""),
+            "content": assistant_content,
             "tool_calls": &tool_calls
         }));
 
+        // Execute each tool, surfacing a status for the UI.
         for tc in &tool_calls {
             let fn_obj = &tc["function"];
             let name = fn_obj["name"].as_str().unwrap_or("");
+            let _ = app.emit("chat-status", tool_status(name));
             let args = if fn_obj["arguments"].is_string() {
                 serde_json::from_str(fn_obj["arguments"].as_str().unwrap_or("{}"))
                     .unwrap_or(serde_json::json!({}))
@@ -509,7 +879,7 @@ pub async fn chat_with_ai(
 
             let result = {
                 let conn = state.0.lock().map_err(|e| e.to_string())?;
-                execute_tool(name, &args, &conn)
+                execute_tool(name, &args, &conn, &app)
             };
 
             ollama_msgs.push(serde_json::json!({
@@ -517,11 +887,81 @@ pub async fn chat_with_ai(
                 "content": result
             }));
         }
+
+        // Tools done — model will now generate; show a neutral status until tokens arrive.
+        let _ = app.emit("chat-status", "Формулирую ответ…");
     }
 
     let _ = app.emit("chat-token", "Превышен лимит запросов к инструментам. Попробуйте ещё раз.");
     let _ = app.emit("chat-done", "");
     Ok(())
+}
+
+/// Compress an older slice of the conversation into a compact summary so the
+/// dialogue can continue without overflowing the context window. One-shot,
+/// no tools, no streaming. Called by the UI when context fills up.
+#[tauri::command]
+pub async fn summarize_conversation(
+    messages: Vec<ChatMessage>,
+    state: State<'_, AppState>,
+) -> Result<String, String> {
+    let settings = {
+        let conn = state.0.lock().map_err(|e| e.to_string())?;
+        db::get_settings(&conn).map_err(|e| e.to_string())?
+    };
+
+    let endpoint = settings.endpoint.replace("localhost", "127.0.0.1");
+    let url = format!("{}/api/chat", endpoint.trim_end_matches('/'));
+    // Summarization must fit the whole older history, so allow a bigger window
+    // for cloud models (local stays capped for VRAM).
+    let is_cloud = !endpoint.contains("127.0.0.1");
+    let sum_ctx = if is_cloud { CLOUD_CTX_CAP } else { LOCAL_CTX_CAP };
+
+    let convo = messages.iter()
+        .map(|m| {
+            let who = if m.role == "user" { "Пользователь" } else { "Ассистент" };
+            format!("{}: {}", who, m.content)
+        })
+        .collect::<Vec<_>>()
+        .join("\n\n");
+
+    let prompt = format!(
+        "Сожми диалог финансового ассистента ниже в краткую сводку (5-8 предложений). \
+         ОБЯЗАТЕЛЬНО сохрани конкретику: заявленные цели накопления (сумма и дата), \
+         названные суммы и категории расходов, факты о пользователе (состав семьи, планы), \
+         данные из выписки и достигнутые договорённости/рекомендации. \
+         Пиши по-русски, от третьего лица, без вступлений и заголовков — только суть.\n\n\
+         ДИАЛОГ:\n{}",
+        convo
+    );
+
+    let body = serde_json::json!({
+        "model": settings.model,
+        "messages": [{ "role": "user", "content": prompt }],
+        "stream": false,
+        "options": { "num_ctx": sum_ctx }
+    });
+
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(120))
+        .build()
+        .map_err(|e| e.to_string())?;
+
+    let mut req = client.post(&url).json(&body);
+    if !settings.api_key.is_empty() {
+        req = req.header("Authorization", format!("Bearer {}", settings.api_key));
+    }
+
+    let resp: serde_json::Value = req.send().await
+        .map_err(|e| e.to_string())?
+        .json().await
+        .map_err(|e| e.to_string())?;
+
+    let summary = resp["message"]["content"].as_str().unwrap_or("").trim().to_string();
+    if summary.is_empty() {
+        return Err("пустая сводка".to_string());
+    }
+    Ok(summary)
 }
 
 // ─── Import Wizard ────────────────────────────────────────────────────────────
@@ -744,6 +1184,7 @@ pub fn commit_import(
     filename: String,
     approved: Vec<ApprovedTx>,
     balance: Option<f64>,
+    kopilka_id: Option<i64>,
     state: State<AppState>,
 ) -> Result<usize, String> {
     let conn = state.0.lock().map_err(|e| e.to_string())?;
@@ -765,7 +1206,87 @@ pub fn commit_import(
         }
     }
 
-    let import_id = db::create_import(&conn, &filename, period_from, period_to, balance)
+    let import_id = db::create_import(&conn, &filename, period_from, period_to, balance, kopilka_id)
         .map_err(|e| e.to_string())?;
     db::commit_transactions(&conn, import_id, &txs).map_err(|e| e.to_string())
+}
+
+// ─── Goals ────────────────────────────────────────────────────────────────────
+
+#[tauri::command]
+pub fn get_goals_with_progress(state: State<AppState>) -> Result<Vec<db::GoalProgress>, String> {
+    let conn = state.0.lock().map_err(|e| e.to_string())?;
+    let goals = db::get_goals(&conn).map_err(|e| e.to_string())?;
+    let mut result = Vec::new();
+    for goal in goals {
+        let spent = db::get_goal_spent(&conn, &goal).map_err(|e| e.to_string())?;
+        let pct = if goal.budget > 0.0 { spent / goal.budget * 100.0 } else { 0.0 };
+        result.push(db::GoalProgress { goal, spent, pct });
+    }
+    Ok(result)
+}
+
+#[tauri::command]
+pub fn create_goal(
+    name: String,
+    goal_type: String,
+    category: String,
+    budget: f64,
+    date_from: String,
+    date_to: String,
+    kopilka_id: Option<i64>,
+    manual_spent: Option<f64>,
+    state: State<AppState>,
+) -> Result<i64, String> {
+    let conn = state.0.lock().map_err(|e| e.to_string())?;
+    db::create_goal(&conn, &name, &goal_type, &category, budget, &date_from, &date_to, kopilka_id, manual_spent)
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub fn delete_goal(id: i64, state: State<AppState>) -> Result<(), String> {
+    let conn = state.0.lock().map_err(|e| e.to_string())?;
+    db::delete_goal(&conn, id).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub fn update_goal(
+    id: i64,
+    name: String,
+    goal_type: String,
+    category: String,
+    budget: f64,
+    date_from: String,
+    date_to: String,
+    kopilka_id: Option<i64>,
+    manual_spent: Option<f64>,
+    state: State<AppState>,
+) -> Result<(), String> {
+    let conn = state.0.lock().map_err(|e| e.to_string())?;
+    db::update_goal(&conn, id, &name, &goal_type, &category, budget, &date_from, &date_to, kopilka_id, manual_spent)
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub fn get_kopilkas(state: State<AppState>) -> Result<Vec<db::Kopilka>, String> {
+    let conn = state.0.lock().map_err(|e| e.to_string())?;
+    db::get_kopilkas(&conn).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub fn create_kopilka(name: String, initial_alias: String, state: State<AppState>) -> Result<i64, String> {
+    let conn = state.0.lock().map_err(|e| e.to_string())?;
+    db::create_kopilka(&conn, &name, &initial_alias).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub fn add_kopilka_alias(kopilka_id: i64, alias: String, state: State<AppState>) -> Result<(), String> {
+    let conn = state.0.lock().map_err(|e| e.to_string())?;
+    db::add_kopilka_alias(&conn, kopilka_id, &alias).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub fn find_unmatched_kopilka_descriptions(state: State<AppState>) -> Result<Vec<(String, i64)>, String> {
+    let conn = state.0.lock().map_err(|e| e.to_string())?;
+    db::find_unmatched_kopilka_descriptions(&conn).map_err(|e| e.to_string())
 }

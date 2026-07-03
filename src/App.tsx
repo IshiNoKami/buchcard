@@ -6,11 +6,13 @@ import { SpendingPie, TopMerchantsBar, DailyArea } from "./components/dashboard/
 import { TransactionTable } from "./components/dashboard/TransactionTable";
 import { ImportWizard } from "./components/wizard/ImportWizard";
 import { Button } from "./components/ui/button";
-import { Upload, RefreshCw, CreditCard, Calendar, Settings, MessageSquare, Trash2, ChevronDown } from "lucide-react";
+import { Upload, RefreshCw, CreditCard, Calendar, Settings, MessageSquare, Trash2, ChevronDown, Wallet, SlidersHorizontal } from "lucide-react";
+import { formatCurrency } from "./lib/utils";
 import { DateRangePicker, DateRange } from "./components/ui/date-range-picker";
 import { useTheme, THEMES } from "./lib/theme";
 import { SettingsPanel } from "./components/SettingsPanel";
 import { ChatPanel } from "./components/ChatPanel";
+import { GoalsWidget } from "./components/dashboard/GoalsWidget";
 
 const MONTHS_RU = ["янв", "фев", "мар", "апр", "май", "июн", "июл", "авг", "сен", "окт", "ноя", "дек"];
 
@@ -39,8 +41,9 @@ export default function App() {
   const [imports, setImports] = useState<Import[]>([]);
   const [selectedImport, setSelectedImport] = useState<Import | null>(null);
   const [customRange, setCustomRange] = useState<DateRange | null>(null);
-  const [period, setPeriod] = useState<"30d" | "90d" | "all">("30d");
+  const [period, setPeriod] = useState<"7d" | "30d" | "90d" | "all">("30d");
   const [showImports, setShowImports] = useState(false);
+  const [showCatFilter, setShowCatFilter] = useState(false);
   const [showWizard, setShowWizard] = useState(false);
   const [showSettings, setShowSettings] = useState(false);
   const [showChat, setShowChat] = useState(false);
@@ -61,6 +64,8 @@ export default function App() {
       setTransactions(txs);
       setCategories(cats);
       setImports(imps);
+      // Notify self-contained widgets (goals) to recompute after any data change.
+      window.dispatchEvent(new CustomEvent("buchcard:data-changed"));
     } finally {
       setLoading(false);
     }
@@ -96,24 +101,80 @@ export default function App() {
     }
   };
 
-  const activeDates = useMemo(() => new Set(transactions.map(tx => tx.date)), [transactions]);
+  // Savings-account imports (kopilkas) are tracked separately — their transactions
+  // must NOT pollute the main account's balance, KPIs or charts.
+  const savingsImportIds = useMemo(
+    () => new Set(imports.filter(imp => imp.kopilka_id != null).map(imp => imp.id)),
+    [imports],
+  );
+
+  // Main account transactions only (exclude anything from a savings-account import)
+  const mainTransactions = useMemo(
+    () => transactions.filter(tx => tx.import_id == null || !savingsImportIds.has(tx.import_id)),
+    [transactions, savingsImportIds],
+  );
+
+  const activeDates = useMemo(() => new Set(mainTransactions.map(tx => tx.date)), [mainTransactions]);
+
+  // Categories the user has taken out of accounting (e.g. ambiguous transfers).
+  const excludedCats = useMemo(
+    () => new Set(categories.filter(c => c.excluded).map(c => c.name)),
+    [categories],
+  );
+
+  const calculatedBalance = useMemo(() => {
+    // The account balance is the user-entered value of the most recent MAIN-account
+    // statement, rolled forward by every real main-account movement since then.
+    // (Transfers/kopilka deposits DO change the real balance, so they are kept here —
+    // only the spending analytics excludes them.)
+    const anchor = [...imports]
+      .filter(imp => imp.balance != null && imp.kopilka_id == null)
+      .sort((a, b) => b.period_to.localeCompare(a.period_to))[0];
+    if (!anchor) return null;
+    const delta = mainTransactions
+      .filter(tx => tx.date > anchor.period_to)
+      .reduce((sum, tx) => sum + (tx.is_income ? tx.amount : -tx.amount), 0);
+    return anchor.balance! + delta;
+  }, [imports, mainTransactions]);
 
   const filtered = useMemo(() => {
+    // If the user explicitly opens a savings-account import, show its own transactions.
+    const source = (selectedImport && savingsImportIds.has(selectedImport.id))
+      ? transactions.filter(tx => tx.import_id === selectedImport.id)
+      : mainTransactions;
+
     if (selectedImport) {
       const { period_from, period_to } = selectedImport;
-      return transactions.filter(tx => tx.date >= period_from && tx.date <= period_to);
+      return source.filter(tx => tx.date >= period_from && tx.date <= period_to);
     }
     if (customRange) {
-      return transactions.filter(tx => tx.date >= customRange.from && tx.date <= customRange.to);
+      return source.filter(tx => tx.date >= customRange.from && tx.date <= customRange.to);
     }
     if (period !== "all") {
-      const days = period === "30d" ? 30 : 90;
+      const days = period === "7d" ? 7 : period === "30d" ? 30 : 90;
       const from = new Date(Date.now() - days * 86_400_000).toISOString().slice(0, 10);
       const to   = new Date().toISOString().slice(0, 10);
-      return transactions.filter(tx => tx.date >= from && tx.date <= to);
+      return source.filter(tx => tx.date >= from && tx.date <= to);
     }
-    return transactions;
-  }, [transactions, selectedImport, customRange, period]);
+    return source;
+  }, [transactions, mainTransactions, savingsImportIds, selectedImport, customRange, period]);
+
+  // Transactions actually counted in analytics — excluded categories are dropped.
+  const analyzed = useMemo(
+    () => excludedCats.size === 0 ? filtered : filtered.filter(tx => !excludedCats.has(tx.category)),
+    [filtered, excludedCats],
+  );
+
+  const toggleCategoryExcluded = useCallback(async (name: string, excluded: boolean) => {
+    // Optimistic update, then persist
+    setCategories(cs => cs.map(c => c.name === name ? { ...c, excluded } : c));
+    try {
+      await invoke("set_category_excluded", { name, excluded });
+    } catch (e) {
+      console.error(e);
+      await load();
+    }
+  }, [load]);
 
   return (
     <div className="min-h-screen bg-background">
@@ -180,7 +241,7 @@ export default function App() {
               <Calendar className="h-3.5 w-3.5 text-muted-foreground shrink-0" />
 
               {/* Quick period buttons */}
-              {(["30d", "90d", "all"] as const).map(p => (
+              {(["7d", "30d", "90d", "all"] as const).map(p => (
                 <button
                   key={p}
                   onClick={() => { setPeriod(p); setCustomRange(null); setSelectedImport(null); }}
@@ -190,7 +251,7 @@ export default function App() {
                       : "border-border text-muted-foreground hover:border-primary/50 hover:text-foreground"
                   }`}
                 >
-                  {p === "30d" ? "30 дней" : p === "90d" ? "90 дней" : "Всё"}
+                  {p === "7d" ? "7 дней" : p === "30d" ? "30 дней" : p === "90d" ? "90 дней" : "Всё"}
                 </button>
               ))}
 
@@ -217,7 +278,54 @@ export default function App() {
                   </button>
                 </>
               )}
+
+              <div className="w-px h-4 bg-border" />
+              <button
+                onClick={() => setShowCatFilter(v => !v)}
+                className={`flex items-center gap-1 px-3 py-1 rounded-full text-xs border transition-colors ${
+                  showCatFilter || excludedCats.size > 0
+                    ? "bg-primary/10 border-primary/40 text-primary"
+                    : "border-border text-muted-foreground hover:border-primary/50 hover:text-foreground"
+                }`}
+                title="Какие категории учитывать в аналитике"
+              >
+                <SlidersHorizontal className="h-3 w-3" />
+                Категории{excludedCats.size > 0 ? ` (−${excludedCats.size})` : ""}
+                <ChevronDown className={`h-3 w-3 transition-transform ${showCatFilter ? "rotate-180" : ""}`} />
+              </button>
             </div>
+
+            {/* Collapsible category filter */}
+            {showCatFilter && (
+              <div className="pl-5 space-y-2">
+                <p className="text-[11px] text-muted-foreground">
+                  Снятые категории не учитываются в балансе, KPI и графиках. Удобно для переводов и взаимозачётов.
+                </p>
+                <div className="flex items-center gap-2 flex-wrap">
+                  {categories.map(c => {
+                    const on = !c.excluded;
+                    return (
+                      <button
+                        key={c.name}
+                        onClick={() => toggleCategoryExcluded(c.name, on)}
+                        className={`flex items-center gap-1.5 px-3 py-1 rounded-full text-xs border transition-colors ${
+                          on
+                            ? "border-border text-foreground hover:border-primary/50"
+                            : "border-dashed border-border/60 text-muted-foreground/50 line-through"
+                        }`}
+                        title={on ? "Учитывается — нажмите чтобы снять" : "Снято — нажмите чтобы вернуть"}
+                      >
+                        <span
+                          className="h-2.5 w-2.5 rounded-full shrink-0"
+                          style={{ background: on ? c.color : "transparent", border: on ? "none" : `1.5px solid ${c.color}` }}
+                        />
+                        {c.name}
+                      </button>
+                    );
+                  })}
+                </div>
+              </div>
+            )}
 
             {/* Collapsible import pills */}
             {showImports && imports.length > 0 && (
@@ -280,21 +388,34 @@ export default function App() {
             </div>
           ) : (
             <>
-              <KpiCards transactions={filtered} />
+              {calculatedBalance != null && (
+                <div className="flex items-center gap-3 rounded-xl border border-border bg-card px-4 py-3 w-fit">
+                  <Wallet className="h-4 w-4 text-sky-400 shrink-0" />
+                  <div>
+                    <p className="text-[11px] text-muted-foreground leading-none mb-0.5">Баланс счёта</p>
+                    <p className={`text-lg font-bold leading-none ${calculatedBalance >= 0 ? "text-sky-400" : "text-red-400"}`}>
+                      {formatCurrency(calculatedBalance)}
+                    </p>
+                  </div>
+                </div>
+              )}
+              <KpiCards transactions={analyzed} />
 
               <div className="grid grid-cols-1 lg:grid-cols-5 gap-5">
                 <div className="lg:col-span-2">
-                  <SpendingPie transactions={filtered} categories={categories} />
+                  <SpendingPie transactions={analyzed} categories={categories} />
                 </div>
                 <div className="lg:col-span-3">
-                  <TopMerchantsBar transactions={filtered} />
+                  <TopMerchantsBar transactions={analyzed} />
                 </div>
               </div>
 
-              <DailyArea transactions={filtered} />
+              <DailyArea transactions={analyzed} />
+
+              <GoalsWidget categories={categories} />
 
               <TransactionTable
-                transactions={filtered}
+                transactions={analyzed}
                 categories={categories}
                 onDelete={async (id) => {
                   await invoke("delete_transaction", { id });

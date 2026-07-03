@@ -1,6 +1,6 @@
 import { formatCurrency } from "@/lib/utils";
 import { Transaction } from "@/lib/types";
-import { TrendingDown, TrendingUp, Wallet, ShoppingCart, Calendar, Scale } from "lucide-react";
+import { TrendingDown, ShoppingCart, Calendar } from "lucide-react";
 
 interface Props {
   transactions: Transaction[];
@@ -12,7 +12,6 @@ export function KpiCards({ transactions }: Props) {
 
   const totalExpense = expenses.reduce((s, t) => s + t.amount, 0);
   const totalIncome  = incomes.reduce((s, t) => s + t.amount, 0);
-  const balance      = totalIncome - totalExpense;
 
   const days = (() => {
     if (!transactions.length) return 1;
@@ -31,13 +30,6 @@ export function KpiCards({ transactions }: Props) {
   const topCat = Object.entries(catTotals).sort((a, b) => b[1] - a[1])[0];
 
   const cards = [
-    {
-      label: "Баланс",
-      value: formatCurrency(Math.abs(balance)),
-      sub: balance >= 0 ? "доходы > расходов" : "расходы > доходов",
-      icon: Scale,
-      color: balance >= 0 ? "text-emerald-400" : "text-red-400",
-    },
     {
       label: "Всего расходов",
       value: formatCurrency(totalExpense),
@@ -62,7 +54,7 @@ export function KpiCards({ transactions }: Props) {
   ];
 
   return (
-    <div className="grid grid-cols-2 lg:grid-cols-4 gap-3">
+    <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
       {cards.map((c) => (
         <div key={c.label} className="rounded-xl border border-border bg-card p-4">
           <div className="flex items-center justify-between mb-2">

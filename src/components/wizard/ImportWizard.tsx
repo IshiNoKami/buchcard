@@ -4,19 +4,24 @@ import { listen } from "@tauri-apps/api/event";
 import { open as openDialog } from "@tauri-apps/plugin-dialog";
 import {
   Transaction, CategorizedTx, ParseResult, ProgressEvent,
-  Category, PdfRow, ParsedPdf,
+  Category, PdfRow, ParsedPdf, Kopilka,
 } from "@/lib/types";
 import { Button } from "@/components/ui/button";
 import { Progress } from "@/components/ui/progress";
 import { Badge } from "@/components/ui/badge";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
-import { formatCurrency, formatDate, cn } from "@/lib/utils";
+import { formatCurrency, cn } from "@/lib/utils";
 import {
   FileUp, Bot, CheckCircle2, ChevronRight, X,
-  Loader2, AlertCircle, AlertTriangle, ArrowRight,
+  Loader2, AlertCircle, AlertTriangle, ArrowRight, PiggyBank, Link2,
 } from "lucide-react";
 
-type Step = "pick" | "parsing" | "pdf-review" | "ai" | "review" | "done";
+type Step = "pick" | "parsing" | "pdf-review" | "ai" | "review" | "kopilka-link" | "done";
+
+type DescriptionAction =
+  | { type: "link"; kopilkaId: number }
+  | { type: "create"; newName: string }
+  | { type: "skip" };
 
 interface EditableRow {
   id: number;
@@ -48,6 +53,17 @@ export function ImportWizard({ categories, onComplete, onClose }: Props) {
   const [committing, setCommitting] = useState(false);
   const logRef = useRef<HTMLDivElement>(null);
 
+  // Kopilka link state (post-commit step)
+  const [unmatchedDescs, setUnmatchedDescs] = useState<[string, number][]>([]);
+  const [kopilkas, setKopilkas] = useState<Kopilka[]>([]);
+  const [descActions, setDescActions] = useState<Record<string, DescriptionAction>>({});
+  const [savingLinks, setSavingLinks] = useState(false);
+
+  // Account type selector
+  const [accountType, setAccountType] = useState<"main" | "savings">("main");
+  const [importKopilkaId, setImportKopilkaId] = useState<number | null>(null);
+  const [importKopilkaText, setImportKopilkaText] = useState("");
+
   // Balance
   const [balance, setBalance] = useState("");
 
@@ -60,6 +76,10 @@ export function ImportWizard({ categories, onComplete, onClose }: Props) {
 
   const catNames = categories.map((c) => c.name);
   const colorMap = Object.fromEntries(categories.map((c) => [c.name, c.color]));
+
+  useEffect(() => {
+    invoke<Kopilka[]>("get_kopilkas").then(setKopilkas).catch(() => {});
+  }, []);
 
   // ── File pick ────────────────────────────────────────────────────────────────
 
@@ -194,13 +214,61 @@ export function ImportWizard({ categories, onComplete, onClose }: Props) {
     }));
     try {
       const balanceVal = balance.trim() ? parseFloat(balance.replace(/\s/g, "").replace(",", ".")) : null;
-      await invoke("commit_import", { filename, approved, balance: balanceVal });
-      setStep("done");
+
+      // Resolve kopilka for savings account imports
+      let finalKopilkaId: number | null = null;
+      if (accountType === "savings") {
+        if (importKopilkaId !== null) {
+          finalKopilkaId = importKopilkaId;
+        } else if (importKopilkaText.trim()) {
+          finalKopilkaId = await invoke<number>("create_kopilka", {
+            name: importKopilkaText.trim(),
+            initialAlias: importKopilkaText.trim(),
+          });
+          setKopilkas(kops => [...kops, { id: finalKopilkaId!, name: importKopilkaText.trim(), aliases: [importKopilkaText.trim()] }]);
+        }
+      }
+
+      await invoke("commit_import", { filename, approved, balance: balanceVal, kopilkaId: finalKopilkaId });
       onComplete();
+
+      // Check for kopilka transactions that don't match any known alias
+      const [unmatched, kops] = await Promise.all([
+        invoke<[string, number][]>("find_unmatched_kopilka_descriptions"),
+        invoke<Kopilka[]>("get_kopilkas"),
+      ]);
+      if (unmatched.length > 0) {
+        const actions: Record<string, DescriptionAction> = {};
+        unmatched.forEach(([desc]) => { actions[desc] = { type: "skip" }; });
+        setUnmatchedDescs(unmatched);
+        setKopilkas(kops);
+        setDescActions(actions);
+        setStep("kopilka-link");
+      } else {
+        setStep("done");
+      }
     } catch (e) {
       console.error(e);
     } finally {
       setCommitting(false);
+    }
+  };
+
+  const confirmKopilkaLinks = async () => {
+    setSavingLinks(true);
+    try {
+      for (const [desc, action] of Object.entries(descActions)) {
+        if (action.type === "link") {
+          await invoke("add_kopilka_alias", { kopilkaId: action.kopilkaId, alias: desc });
+        } else if (action.type === "create" && action.newName.trim()) {
+          await invoke("create_kopilka", { name: action.newName.trim(), initialAlias: desc });
+        }
+      }
+      setStep("done");
+    } catch (e) {
+      console.error(e);
+    } finally {
+      setSavingLinks(false);
     }
   };
 
@@ -222,8 +290,8 @@ export function ImportWizard({ categories, onComplete, onClose }: Props) {
       ];
 
   const stepIdx = isPdf
-    ? ({ pick: 0, parsing: 0, "pdf-review": 1, ai: 2, review: 3, done: 4 } as Record<string, number>)[step] ?? 0
-    : ({ pick: 0, parsing: 0, ai: 1, review: 2, done: 3 } as Record<string, number>)[step] ?? 0;
+    ? ({ pick: 0, parsing: 0, "pdf-review": 1, ai: 2, review: 3, "kopilka-link": 4, done: 4 } as Record<string, number>)[step] ?? 0
+    : ({ pick: 0, parsing: 0, ai: 1, review: 2, "kopilka-link": 3, done: 3 } as Record<string, number>)[step] ?? 0;
 
   // ── Helpers for editable rows ────────────────────────────────────────────────
 
@@ -310,22 +378,96 @@ export function ImportWizard({ categories, onComplete, onClose }: Props) {
                   Поддерживаемые форматы: .xls, .xlsx, .pdf
                 </p>
               </div>
-              <div className="w-64">
-                <label className="text-xs text-muted-foreground block mb-1 text-center">
-                  Актуальный баланс (₽) — необязательно
-                </label>
-                <input
-                  type="text"
-                  inputMode="decimal"
-                  value={balance}
-                  onChange={e => setBalance(e.target.value)}
-                  placeholder="например: 24 500"
-                  className="w-full px-3 py-2 rounded-lg border border-border bg-background text-sm text-center focus:outline-none focus:ring-1 focus:ring-primary"
-                />
+
+              {/* Account type selector */}
+              <div className="w-80 space-y-3">
+                <div>
+                  <p className="text-xs text-muted-foreground mb-2 text-center">Какой счёт в выписке?</p>
+                  <div className="grid grid-cols-2 gap-2">
+                    <button
+                      onClick={() => setAccountType("main")}
+                      className={cn(
+                        "flex flex-col items-center gap-1 px-3 py-2.5 rounded-lg border text-sm transition-colors",
+                        accountType === "main"
+                          ? "border-primary bg-primary/10 text-foreground"
+                          : "border-border text-muted-foreground hover:border-primary/50"
+                      )}
+                    >
+                      <span className="text-base">💳</span>
+                      <span className="text-xs">Основной счёт</span>
+                    </button>
+                    <button
+                      onClick={() => setAccountType("savings")}
+                      className={cn(
+                        "flex flex-col items-center gap-1 px-3 py-2.5 rounded-lg border text-sm transition-colors",
+                        accountType === "savings"
+                          ? "border-sky-500 bg-sky-500/10 text-sky-400"
+                          : "border-border text-muted-foreground hover:border-sky-500/50"
+                      )}
+                    >
+                      <PiggyBank className="h-4 w-4" />
+                      <span className="text-xs">Накопительный</span>
+                    </button>
+                  </div>
+                </div>
+
+                {/* Kopilka selector for savings account */}
+                {accountType === "savings" && (
+                  <div className="rounded-lg border border-sky-500/20 bg-sky-500/5 p-3 space-y-2">
+                    <p className="text-xs text-sky-400 font-medium">Копилка</p>
+                    <div className="relative">
+                      <input
+                        type="text"
+                        value={importKopilkaText}
+                        onChange={e => { setImportKopilkaText(e.target.value); setImportKopilkaId(null); }}
+                        placeholder="Название копилки"
+                        list="kopilka-list-import"
+                        className="w-full px-3 py-2 rounded-lg border border-sky-500/30 bg-background text-sm focus:outline-none focus:ring-1 focus:ring-sky-500"
+                      />
+                      <datalist id="kopilka-list-import">
+                        {kopilkas.map(k => (
+                          <option key={k.id} value={k.name} />
+                        ))}
+                      </datalist>
+                    </div>
+                    {(() => {
+                      const matched = kopilkas.find(k => k.name.toLowerCase() === importKopilkaText.toLowerCase());
+                      if (matched && !importKopilkaId) setImportKopilkaId(matched.id);
+                      return matched
+                        ? <p className="text-[11px] text-sky-400">Связать с «{matched.name}»</p>
+                        : importKopilkaText.trim()
+                          ? <p className="text-[11px] text-muted-foreground">Будет создана новая копилка</p>
+                          : <p className="text-[11px] text-muted-foreground">Введите название или выберите существующую</p>;
+                    })()}
+                  </div>
+                )}
+
+                {/* Balance */}
+                <div>
+                  <label className="text-xs text-muted-foreground block mb-1 text-center">
+                    Актуальный баланс (₽) — необязательно
+                  </label>
+                  <input
+                    type="text"
+                    inputMode="decimal"
+                    value={balance}
+                    onChange={e => setBalance(e.target.value)}
+                    placeholder="например: 24 500"
+                    className="w-full px-3 py-2 rounded-lg border border-border bg-background text-sm text-center focus:outline-none focus:ring-1 focus:ring-primary"
+                  />
+                </div>
               </div>
-              <Button onClick={pickFile} size="lg">
+
+              <Button
+                onClick={pickFile}
+                size="lg"
+                disabled={accountType === "savings" && !importKopilkaText.trim()}
+              >
                 Выбрать файл
               </Button>
+              {accountType === "savings" && !importKopilkaText.trim() && (
+                <p className="text-xs text-muted-foreground -mt-2">Укажите название копилки</p>
+              )}
             </div>
           )}
 
@@ -618,9 +760,13 @@ export function ImportWizard({ categories, onComplete, onClose }: Props) {
                 );
               })()}
 
-              {categorized
-                .filter((c) => c.source !== "keyword")
-                .map((c) => {
+              {Array.from(
+                new Map(
+                  categorized
+                    .filter((c) => c.source !== "keyword")
+                    .map((c) => [c.tx.merchant_key, c])
+                ).values()
+              ).map((c) => {
                   const currentCat = editedCats[c.tx.merchant_key] ?? c.tx.category;
                   const conf = c.confidence ?? 1;
                   const isLow = conf < 0.5;
@@ -704,6 +850,104 @@ export function ImportWizard({ categories, onComplete, onClose }: Props) {
             </div>
           )}
 
+          {/* ── Kopilka link ── */}
+          {step === "kopilka-link" && (
+            <div className="space-y-4">
+              <div className="flex items-start gap-3">
+                <PiggyBank className="h-5 w-5 text-sky-400 shrink-0 mt-0.5" />
+                <div>
+                  <p className="text-sm font-medium">Связать поступления с копилкой?</p>
+                  <p className="text-xs text-muted-foreground mt-0.5">
+                    Ниже все поступления из базы. Отметьте те, которые относятся к вашей копилке — и они будут учитываться в целях накопления.
+                  </p>
+                </div>
+              </div>
+
+              <div className="space-y-2">
+                {unmatchedDescs.map(([desc, count]) => {
+                  const action = descActions[desc] ?? { type: "skip" };
+                  const shortDesc = desc.length > 70 ? desc.slice(0, 70) + "…" : desc;
+                  return (
+                    <div
+                      key={desc}
+                      className={cn(
+                        "rounded-lg border p-3 space-y-2 transition-colors",
+                        action.type !== "skip"
+                          ? "border-sky-500/40 bg-sky-500/5"
+                          : "border-border/40 bg-secondary/10"
+                      )}
+                    >
+                      <div className="flex items-start gap-2">
+                        <Link2 className={cn("h-3.5 w-3.5 shrink-0 mt-0.5", action.type !== "skip" ? "text-sky-400" : "text-muted-foreground/40")} />
+                        <span className="text-xs text-foreground flex-1 break-words">{shortDesc}</span>
+                        <span className="text-[11px] text-muted-foreground shrink-0 ml-1">{count}×</span>
+                      </div>
+
+                      <div className="flex gap-2 flex-wrap pl-5">
+                        <button
+                          onClick={() => setDescActions(a => ({ ...a, [desc]: { type: "skip" } }))}
+                          className={cn(
+                            "px-2.5 py-1 rounded-md text-xs border transition-colors",
+                            action.type === "skip"
+                              ? "border-border bg-secondary text-foreground"
+                              : "border-border/40 text-muted-foreground hover:border-border"
+                          )}
+                        >
+                          Не копилка
+                        </button>
+                        <button
+                          onClick={() => setDescActions(a => ({ ...a, [desc]: { type: "create", newName: "Копилочка" } }))}
+                          className={cn(
+                            "px-2.5 py-1 rounded-md text-xs border transition-colors",
+                            action.type === "create"
+                              ? "border-sky-500 bg-sky-500/10 text-sky-400"
+                              : "border-border/40 text-muted-foreground hover:border-border"
+                          )}
+                        >
+                          Это копилка
+                        </button>
+                        {kopilkas.length > 0 && (
+                          <select
+                            value={action.type === "link" ? String(action.kopilkaId) : ""}
+                            onChange={e => {
+                              const id = parseInt(e.target.value);
+                              if (id) {
+                                setDescActions(a => ({ ...a, [desc]: { type: "link", kopilkaId: id } }));
+                              }
+                            }}
+                            className={cn(
+                              "px-2.5 py-1 rounded-md text-xs border bg-background transition-colors",
+                              action.type === "link"
+                                ? "border-sky-500 text-sky-400"
+                                : "border-border/40 text-muted-foreground"
+                            )}
+                          >
+                            <option value="">Связать с существующей...</option>
+                            {kopilkas.map(k => (
+                              <option key={k.id} value={k.id}>{k.name}</option>
+                            ))}
+                          </select>
+                        )}
+                      </div>
+
+                      {action.type === "create" && (
+                        <div className="pl-5">
+                          <input
+                            type="text"
+                            value={action.newName}
+                            onChange={e => setDescActions(a => ({ ...a, [desc]: { type: "create", newName: e.target.value } }))}
+                            placeholder="Название копилки"
+                            className="w-full px-2.5 py-1.5 rounded-md text-xs border border-sky-500/40 bg-background focus:outline-none focus:ring-1 focus:ring-sky-500"
+                          />
+                        </div>
+                      )}
+                    </div>
+                  );
+                })}
+              </div>
+            </div>
+          )}
+
           {/* ── Done ── */}
           {step === "done" && (
             <div className="flex flex-col items-center justify-center min-h-48 gap-4">
@@ -761,6 +1005,30 @@ export function ImportWizard({ categories, onComplete, onClose }: Props) {
                 </>
               ) : (
                 "Подтвердить и сохранить"
+              )}
+            </Button>
+          </div>
+        )}
+
+        {step === "kopilka-link" && (
+          <div className="px-6 py-4 border-t border-border bg-secondary/20 flex items-center justify-between shrink-0">
+            <button
+              onClick={() => setStep("done")}
+              className="text-xs text-muted-foreground hover:text-foreground transition-colors"
+            >
+              Пропустить всё
+            </button>
+            <Button onClick={confirmKopilkaLinks} disabled={savingLinks}>
+              {savingLinks ? (
+                <>
+                  <Loader2 className="h-4 w-4 animate-spin mr-2" />
+                  Сохраняем...
+                </>
+              ) : (
+                <>
+                  <PiggyBank className="h-4 w-4 mr-1.5" />
+                  Сохранить связи
+                </>
               )}
             </Button>
           </div>
