@@ -65,6 +65,8 @@ pub fn run() {
             commands::get_net_worth_parts,
             commands::get_month_comparison,
             commands::get_cash_forecast,
+            commands::get_debt_strategy,
+            commands::set_debt_alloc_pct,
             commands::get_due_reminders,
             commands::find_credit_payment_candidates,
             commands::get_planned_items,

@@ -183,6 +183,44 @@ export interface PlannedItem {
   created_at: string;
 }
 
+export interface StrategyOutcome {
+  months: number;              // -1 = долг не гасится
+  total_interest: number;
+  debt_free_date?: string | null;
+}
+
+export interface DebtStrategy {
+  has_loans: boolean;
+  balance_known: boolean;
+  monthly_flow: number;
+  extra_available: number;
+  buffer: number;
+  limit_reason?: string | null;
+  target?: { credit_id: number; name: string; rate_annual: number; reason: string } | null;
+  card_alert?: string | null;
+  order: { name: string; rate_annual: number; balance: number }[];
+  baseline: StrategyOutcome;
+  strategy: StrategyOutcome;
+  saved_interest: number;
+  months_saved: number;
+  chart: { date: string; baseline: number; strategy: number }[];
+  alloc_pct: number;
+  monthly_plan: MonthPlan[];
+}
+
+export interface MonthPlanItem {
+  name: string;
+  scheduled: number;
+  extra: number;
+  balance_after: number;
+}
+
+export interface MonthPlan {
+  date: string;
+  total_extra: number;
+  items: MonthPlanItem[];
+}
+
 export interface CreditPaymentCandidate {
   tx_id: number;
   date: string;

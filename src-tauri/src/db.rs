@@ -1145,6 +1145,30 @@ pub fn find_unmatched_kopilka_descriptions(conn: &Connection) -> Result<Vec<(Str
     Ok(rows)
 }
 
+/// Баланс основного счёта: введённый пользователем остаток последнего
+/// основного импорта + все движения основного счёта после его периода.
+/// Зеркалит логику calculatedBalance из App.tsx. None = якоря нет.
+pub fn compute_account_balance(conn: &Connection) -> Result<Option<f64>> {
+    let anchor: Option<(String, f64)> = conn.query_row(
+        "SELECT period_to, balance FROM imports
+         WHERE balance IS NOT NULL AND kopilka_id IS NULL
+         ORDER BY period_to DESC LIMIT 1",
+        [],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    ).ok();
+    let Some((period_to, balance)) = anchor else { return Ok(None) };
+
+    let delta: f64 = conn.query_row(
+        "SELECT COALESCE(SUM(CASE WHEN t.is_income = 1 THEN t.amount ELSE -t.amount END), 0)
+         FROM transactions t
+         LEFT JOIN imports i ON t.import_id = i.id
+         WHERE t.date > ?1 AND i.kopilka_id IS NULL",
+        params![period_to],
+        |r| r.get(0),
+    )?;
+    Ok(Some(balance + delta))
+}
+
 /// Сумма накоплений: депозиты (is_income=1) из импортов, помеченных копилкой.
 pub fn get_kopilka_saved_total(conn: &Connection) -> Result<f64> {
     let total: f64 = conn.query_row(

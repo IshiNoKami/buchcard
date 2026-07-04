@@ -446,6 +446,14 @@ fn ollama_tools() -> serde_json::Value {
                 "description": "Активные финансовые цели пользователя: лимиты расходов и цели накопления, их бюджеты, текущий прогресс (сколько потрачено/накоплено), сроки. Вызывай при вопросах о целях, накоплениях, планах.",
                 "parameters": { "type": "object", "properties": {}, "required": [] }
             }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "get_debt_strategy",
+                "description": "ГОТОВАЯ оптимальная стратегия сокращения долга, вся математика уже посчитана: безопасная сумма досрочного погашения в месяц (extra_available, с учётом прогноза баланса и страхового буфера), какой кредит гасить первым (target, метод «лавина» — максимальная ставка), порядок гашения (order), сравнение траекторий baseline/strategy (месяцы, переплата, дата свободы от долгов), экономия (saved_interest, months_saved), предупреждение по кредитке (card_alert). Вызывай при вопросах «как быстрее погасить кредиты», «что гасить досрочно», «сколько я сэкономлю». НЕ пересчитывай ничего сам — пересказывай готовые цифры.",
+                "parameters": { "type": "object", "properties": {}, "required": [] }
+            }
         }
     ])
 }
@@ -512,6 +520,7 @@ fn tool_status(name: &str) -> &'static str {
         "propose_goal"           => "Формирую предложение цели…",
         "get_credits_info"       => "Смотрю кредиты…",
         "get_goals_info"         => "Проверяю цели…",
+        "get_debt_strategy"      => "Считаю стратегию погашения…",
         _                        => "Анализирую данные…",
     }
 }
@@ -612,6 +621,16 @@ fn execute_tool(name: &str, args: &serde_json::Value, conn: &rusqlite::Connectio
                     } else {
                         serde_json::to_string(&statuses).unwrap_or_default()
                     }
+                }
+                Err(e) => format!("{{\"error\": \"{}\"}}", e),
+            }
+        }
+        "get_debt_strategy" => {
+            match compute_debt_strategy(conn, None) {
+                Ok(mut s) => {
+                    s.monthly_plan.truncate(12); // чату достаточно года — не раздуваем контекст
+                    s.chart.clear();             // график для UI, модели не нужен
+                    serde_json::to_string(&s).unwrap_or_default()
                 }
                 Err(e) => format!("{{\"error\": \"{}\"}}", e),
             }
@@ -722,6 +741,7 @@ pub async fn chat_with_ai(
          4. После получения нужных данных сразу давай ответ, без лишних вызовов.\n\
          7. Если анализ показывает категорию с аномально высокими расходами (>30% бюджета или явный пик) — предложи конкретную цель-ограничение через propose_goal. Объясни кратко почему, затем вызови инструмент. Не создавай цели молча — сначала объясни, потом вызывай.\n\
          8. У тебя есть данные о кредитах (get_credits_info: остатки, ставки, платежи, переплата) и целях (get_goals_info: прогресс лимитов и накоплений). При вопросах о долгах, досрочном погашении, 'гасить или копить' — СНАЧАЛА вызови эти инструменты, потом советуй с реальными цифрами.\n\
+         9. Для стратегии погашения долгов есть get_debt_strategy — там УЖЕ посчитано: безопасная досрочка в месяц, какой кредит гасить первым, экономия и дата свободы от долгов. При вопросах 'как быстрее расплатиться', 'что гасить первым', 'сколько сэкономлю' — вызови его и пересказывай готовые цифры, ничего не пересчитывая.\n\
          5. Отвечай на русском, суммы в ₽. Называй точные цифры и указывай период анализа (days_in_period).\n\
          6. Не путай расходы и доходы.",
         today
@@ -1784,9 +1804,18 @@ pub fn get_cash_forecast(
     days: Option<i64>,
     state: State<AppState>,
 ) -> Result<CashForecast, String> {
-    use chrono::{Datelike, Duration};
     let conn = state.0.lock().map_err(|e| e.to_string())?;
-    let days = days.unwrap_or(30).clamp(7, 365);
+    build_cash_forecast(&conn, current_balance, days.unwrap_or(30))
+}
+
+/// Внутренняя сборка прогноза — используется командой и стратегией погашения.
+fn build_cash_forecast(
+    conn: &rusqlite::Connection,
+    current_balance: f64,
+    days: i64,
+) -> Result<CashForecast, String> {
+    use chrono::{Datelike, Duration};
+    let days = days.clamp(7, 365);
     let today = chrono::Local::now().date_naive();
 
     let settings = db::get_settings(&conn).map_err(|e| e.to_string())?;
@@ -1909,6 +1938,313 @@ pub fn get_cash_forecast(
         min_date,
         has_gap: min_balance < 0.0,
         daily_avg: (daily_avg * 100.0).round() / 100.0,
+    })
+}
+
+// ─── Debt strategy ──────────────────────────────────────────────────────────
+
+#[derive(Debug, Serialize)]
+pub struct StrategyOutcome {
+    pub months: i64,             // -1 = долг не гасится
+    pub total_interest: f64,
+    pub debt_free_date: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct StrategyTarget {
+    pub credit_id: i64,
+    pub name: String,
+    pub rate_annual: f64,
+    pub reason: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct DebtOrderItem {
+    pub name: String,
+    pub rate_annual: f64,
+    pub balance: f64,
+}
+
+#[derive(Debug, Serialize)]
+pub struct DebtChartPoint {
+    pub date: String,
+    pub baseline: f64,
+    pub strategy: f64,
+}
+
+#[derive(Debug, Serialize)]
+pub struct MonthPlanItem {
+    pub name: String,
+    pub scheduled: f64,
+    pub extra: f64,
+    pub balance_after: f64,
+}
+
+#[derive(Debug, Serialize)]
+pub struct MonthPlan {
+    pub date: String,
+    pub total_extra: f64,
+    pub items: Vec<MonthPlanItem>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct DebtStrategy {
+    pub has_loans: bool,
+    pub balance_known: bool,
+    pub monthly_flow: f64,       // свободный поток: доходы − платежи − быт
+    pub extra_available: f64,    // безопасная сумма досрочки в месяц
+    pub buffer: f64,             // страховой запас (неделя быта)
+    pub limit_reason: Option<String>,
+    pub target: Option<StrategyTarget>,
+    pub card_alert: Option<String>,
+    pub order: Vec<DebtOrderItem>,   // порядок гашения («лавина»)
+    pub baseline: StrategyOutcome,   // как сейчас
+    pub strategy: StrategyOutcome,   // с досрочкой
+    pub saved_interest: f64,
+    pub months_saved: i64,
+    pub chart: Vec<DebtChartPoint>,  // траектории долга по месяцам
+    pub alloc_pct: f64,              // % свободных денег на досрочку (настройка)
+    pub monthly_plan: Vec<MonthPlan>, // помесячный план платежей по стратегии
+}
+
+/// Стратегия сокращения долга: вся математика здесь, в Rust.
+/// Свободный поток и запас берутся из прогноза баланса; досрочка — «лавиной»
+/// (максимальная ставка первой) в режиме «сократить срок».
+/// alloc_pct — живой предпросмотр со слайдера; None = сохранённая настройка.
+#[tauri::command]
+pub fn get_debt_strategy(alloc_pct: Option<f64>, state: State<AppState>) -> Result<DebtStrategy, String> {
+    let conn = state.0.lock().map_err(|e| e.to_string())?;
+    compute_debt_strategy(&conn, alloc_pct)
+}
+
+/// Сохранить долю свободных денег, направляемую на досрочку (0–100%).
+#[tauri::command]
+pub fn set_debt_alloc_pct(pct: f64, state: State<AppState>) -> Result<(), String> {
+    let conn = state.0.lock().map_err(|e| e.to_string())?;
+    conn.execute(
+        "INSERT INTO settings(key,value) VALUES('debt_alloc_pct', ?1)
+         ON CONFLICT(key) DO UPDATE SET value=?1",
+        [pct.clamp(0.0, 100.0).to_string()],
+    ).map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+fn saved_alloc_pct(conn: &rusqlite::Connection) -> f64 {
+    conn.query_row(
+        "SELECT value FROM settings WHERE key='debt_alloc_pct'",
+        [],
+        |r| r.get::<_, String>(0),
+    )
+    .ok()
+    .and_then(|v| v.parse::<f64>().ok())
+    .map(|v| v.clamp(0.0, 100.0))
+    .unwrap_or(100.0)
+}
+
+fn compute_debt_strategy(conn: &rusqlite::Connection, alloc_pct: Option<f64>) -> Result<DebtStrategy, String> {
+    let alloc_pct = alloc_pct
+        .map(|v| v.clamp(0.0, 100.0))
+        .unwrap_or_else(|| saved_alloc_pct(conn));
+    let today = today_str();
+    let credits = db::get_credits(conn).map_err(|e| e.to_string())?;
+
+    // Кредиты для симуляции
+    let loans: Vec<(i64, String, crate::credit::SimLoan)> = credits.iter()
+        .filter(|c| !c.archived && c.kind == "loan" && c.current_balance > 0.005)
+        .filter_map(|c| {
+            let payment = c.scheduled_payment?;
+            (payment > 0.0).then(|| (c.id, c.name.clone(), crate::credit::SimLoan {
+                balance: c.current_balance,
+                rate_annual: c.rate_annual,
+                payment,
+            }))
+        })
+        .collect();
+
+    // Предупреждение по картам: долг + истекающий грейс
+    let card_alert = credits.iter()
+        .filter(|c| !c.archived && c.kind == "card" && c.current_balance > 0.005)
+        .find_map(|c| {
+            let (_, days_left) = match (c.statement_day, c.grace_days) {
+                (Some(sd), Some(gd)) => crate::credit::grace_status(&today, sd, gd),
+                _ => (None, None),
+            };
+            let days_left = days_left?;
+            (days_left <= 7).then(|| format!(
+                "По карте «{}» долг {:.0} ₽, льготный период истекает через {} дн. — погасите её в первую очередь, иначе начнут капать {}% годовых.",
+                c.name, c.current_balance, days_left.max(0), c.rate_annual
+            ))
+        });
+
+    if loans.is_empty() {
+        return Ok(DebtStrategy {
+            has_loans: false,
+            balance_known: false,
+            monthly_flow: 0.0, extra_available: 0.0, buffer: 0.0,
+            limit_reason: None, target: None, card_alert,
+            order: vec![],
+            baseline: StrategyOutcome { months: 0, total_interest: 0.0, debt_free_date: None },
+            strategy: StrategyOutcome { months: 0, total_interest: 0.0, debt_free_date: None },
+            saved_interest: 0.0, months_saved: 0,
+            chart: vec![],
+            alloc_pct,
+            monthly_plan: vec![],
+        });
+    }
+
+    // Свободные деньги: считаем из прогноза (баланс из Rust-якоря)
+    let balance = db::compute_account_balance(conn).map_err(|e| e.to_string())?;
+    let balance_known = balance.is_some();
+    let settings = db::get_settings(conn).map_err(|e| e.to_string())?;
+    let monthly_income = settings.advance_amount.unwrap_or(0.0) + settings.salary_amount.unwrap_or(0.0);
+    let mandatory: f64 = loans.iter().map(|(_, _, l)| l.payment).sum();
+
+    let (daily_avg, forecast_min) = match balance {
+        Some(b) => {
+            let fc = build_cash_forecast(conn, b, 30)?;
+            (fc.daily_avg, fc.min_balance)
+        }
+        None => (0.0, 0.0),
+    };
+    let byt_month = daily_avg * 30.0;
+    let monthly_flow = monthly_income - mandatory - byt_month;
+    let buffer = daily_avg * 7.0; // недельный запас быта
+
+    let limit_reason: Option<String> = if !balance_known {
+        Some("Неизвестен баланс счёта — укажите его при импорте выписки.".to_string())
+    } else if monthly_income <= 0.0 {
+        Some("Не заполнены аванс/зарплата в настройках — свободный поток неизвестен.".to_string())
+    } else if monthly_flow <= 0.0 {
+        Some("Свободного потока нет: доходы покрывают только платежи и быт.".to_string())
+    } else if forecast_min - buffer <= 0.0 {
+        Some(format!(
+            "Досрочка сейчас рискованна: минимум прогноза {:.0} ₽ не оставляет недельного запаса ({:.0} ₽).",
+            forecast_min, buffer
+        ))
+    } else {
+        None
+    };
+
+    // Порядок «лавины» и цель
+    let mut order_items: Vec<DebtOrderItem> = loans.iter()
+        .map(|(_, name, l)| DebtOrderItem { name: name.clone(), rate_annual: l.rate_annual, balance: l.balance })
+        .collect();
+    order_items.sort_by(|a, b| b.rate_annual.partial_cmp(&a.rate_annual).unwrap_or(std::cmp::Ordering::Equal));
+
+    let target = loans.iter()
+        .max_by(|a, b| a.2.rate_annual.partial_cmp(&b.2.rate_annual).unwrap_or(std::cmp::Ordering::Equal))
+        .map(|(id, name, l)| StrategyTarget {
+            credit_id: *id,
+            name: name.clone(),
+            rate_annual: l.rate_annual,
+            reason: format!("Самая высокая ставка ({}%) — каждый досрочный рубль здесь экономит больше всего процентов. Режим «сократить срок».", l.rate_annual),
+        });
+
+    // Досрочка по месяцам с учётом будущих периодов: плановые расходы месяца
+    // уменьшают свободные деньги, плановые доходы — увеличивают. Первый месяц
+    // дополнительно ограничен запасом из прогноза (защита от кассового разрыва).
+    const SIM_MONTHS: usize = 120;
+    let base_flow = monthly_flow.max(0.0);
+    let month0_cap = if balance_known && forecast_min - buffer > 0.0 {
+        forecast_min - buffer
+    } else {
+        0.0
+    };
+    let today_date = chrono::NaiveDate::parse_from_str(&today, "%Y-%m-%d").unwrap();
+    let planned_items = db::get_planned_items(conn).map_err(|e| e.to_string())?;
+    let mut planned_net = vec![0.0f64; SIM_MONTHS]; // + доход / − расход в месяце k
+    for p in planned_items.iter().filter(|p| p.date.as_str() > today.as_str()) {
+        if let Ok(d) = chrono::NaiveDate::parse_from_str(&p.date[..p.date.len().min(10)], "%Y-%m-%d") {
+            let k = ((d - today_date).num_days() / 30) as usize;
+            if k < SIM_MONTHS {
+                planned_net[k] += if p.kind == "income" { p.amount } else { -p.amount };
+            }
+        }
+    }
+    // Ползунок: пользователь направляет на досрочку только долю свободных денег.
+    // Защита от кассового разрыва (month0_cap) применяется поверх и не отключается.
+    let pct = alloc_pct / 100.0;
+    let extra_by_month: Vec<f64> = (0..SIM_MONTHS)
+        .map(|k| {
+            let e = (base_flow + planned_net[k]).max(0.0) * pct;
+            if k == 0 { e.min(month0_cap) } else { e }
+        })
+        .collect();
+
+    // Показ пользователю: реальная досрочка первого месяца (после ползунка и защиты)
+    let extra_available = (extra_by_month[0] / 100.0).floor() * 100.0;
+    let limit_reason = if limit_reason.is_none() && alloc_pct <= 0.0 {
+        Some("Досрочка отключена ползунком (0% свободных денег).".to_string())
+    } else {
+        limit_reason
+    };
+
+    // Траектории
+    let sim: Vec<crate::credit::SimLoan> = loans.iter().map(|(_, _, l)| l.clone()).collect();
+    let base_res = crate::credit::simulate_repayment_schedule(&sim, &[]);
+    let strat_res = crate::credit::simulate_repayment_schedule(&sim, &extra_by_month);
+    let (m0, i0) = (base_res.months, base_res.total_interest);
+    let (m1, i1) = (strat_res.months, strat_res.total_interest);
+    let outcome = |months: i64, interest: f64| StrategyOutcome {
+        months,
+        total_interest: (interest * 100.0).round() / 100.0,
+        debt_free_date: (months > 0).then(|| crate::credit::date_after_months(&today, months)).flatten(),
+    };
+
+    // График «без досрочки vs со стратегией» помесячно (cap 120 точек)
+    let initial_debt: f64 = sim.iter().map(|l| l.balance).sum();
+    let chart_len = base_res.debt_by_month.len().max(strat_res.debt_by_month.len()).min(SIM_MONTHS);
+    let mut chart = Vec::with_capacity(chart_len + 1);
+    chart.push(DebtChartPoint { date: today.clone(), baseline: initial_debt, strategy: initial_debt });
+    for m in 1..=chart_len {
+        let date = crate::credit::date_after_months(&today, m as i64).unwrap_or_else(|| today.clone());
+        let b = base_res.debt_by_month.get(m - 1).copied().unwrap_or(0.0);
+        let s = strat_res.debt_by_month.get(m - 1).copied().unwrap_or(0.0);
+        chart.push(DebtChartPoint {
+            date,
+            baseline: (b * 100.0).round() / 100.0,
+            strategy: (s * 100.0).round() / 100.0,
+        });
+    }
+
+    // Помесячный план стратегии: плановый платёж + досрочка по каждому кредиту
+    let loan_names: Vec<&String> = loans.iter().map(|(_, n, _)| n).collect();
+    let monthly_plan: Vec<MonthPlan> = strat_res.monthly_detail.iter()
+        .take(SIM_MONTHS)
+        .enumerate()
+        .map(|(m, detail)| {
+            let date = crate::credit::date_after_months(&today, (m + 1) as i64)
+                .unwrap_or_else(|| today.clone());
+            let items: Vec<MonthPlanItem> = detail.iter().enumerate()
+                .map(|(i, d)| MonthPlanItem {
+                    name: loan_names[i].clone(),
+                    scheduled: (d.scheduled_paid * 100.0).round() / 100.0,
+                    extra: (d.extra_paid * 100.0).round() / 100.0,
+                    balance_after: (d.balance_after * 100.0).round() / 100.0,
+                })
+                .collect();
+            let total_extra = (items.iter().map(|i| i.extra).sum::<f64>() * 100.0).round() / 100.0;
+            MonthPlan { date, total_extra, items }
+        })
+        .collect();
+
+    Ok(DebtStrategy {
+        has_loans: true,
+        balance_known,
+        monthly_flow: (monthly_flow * 100.0).round() / 100.0,
+        extra_available,
+        buffer: (buffer * 100.0).round() / 100.0,
+        limit_reason,
+        target,
+        card_alert,
+        order: order_items,
+        baseline: outcome(m0, i0),
+        strategy: outcome(m1, i1),
+        saved_interest: ((i0 - i1) * 100.0).round() / 100.0,
+        months_saved: if m0 > 0 && m1 > 0 { m0 - m1 } else { 0 },
+        chart,
+        alloc_pct,
+        monthly_plan,
     })
 }
 

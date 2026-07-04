@@ -1,8 +1,12 @@
 import { useState, useEffect, useCallback } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import { Plus, Trash2, Pencil, Landmark, CreditCard, CalendarClock, ListTree } from "lucide-react";
-import { CreditStatus, Credit, ScheduleRow } from "@/lib/types";
+import { Plus, Trash2, Pencil, Landmark, CreditCard, CalendarClock, ListTree, Rocket, AlertTriangle } from "lucide-react";
+import {
+  ResponsiveContainer, AreaChart, Area, XAxis, YAxis, CartesianGrid, Tooltip,
+} from "recharts";
+import { CreditStatus, Credit, ScheduleRow, DebtStrategy, MonthPlan } from "@/lib/types";
 import { formatCurrency, formatDate, cn } from "@/lib/utils";
+import { useChartColors } from "@/lib/theme";
 
 type Kind = "loan" | "card";
 
@@ -44,7 +48,11 @@ function utilColor(pct: number): string {
 }
 
 export function CreditsWidget() {
+  const chartColors = useChartColors();
   const [credits, setCredits] = useState<CreditStatus[]>([]);
+  const [debtStrategy, setDebtStrategy] = useState<DebtStrategy | null>(null);
+  const [allocPct, setAllocPct] = useState<number | null>(null); // null = ещё не загружено
+  const [monthDetail, setMonthDetail] = useState<MonthPlan | null>(null);
   const [showForm, setShowForm] = useState(false);
   const [form, setForm] = useState<FormState>(DEFAULT_FORM);
   const [editId, setEditId] = useState<number | null>(null);
@@ -64,7 +72,31 @@ export function CreditsWidget() {
 
   const load = useCallback(async () => {
     try {
-      setCredits(await invoke<CreditStatus[]>("get_credits"));
+      const [creds, strat] = await Promise.all([
+        invoke<CreditStatus[]>("get_credits"),
+        invoke<DebtStrategy>("get_debt_strategy", { allocPct: null }).catch(() => null),
+      ]);
+      setCredits(creds);
+      setDebtStrategy(strat);
+      if (strat) setAllocPct(strat.alloc_pct);
+    } catch (e) {
+      console.error(e);
+    }
+  }, []);
+
+  // Живой пересчёт стратегии при движении ползунка
+  const previewAlloc = useCallback(async (pct: number) => {
+    setAllocPct(pct);
+    try {
+      setDebtStrategy(await invoke<DebtStrategy>("get_debt_strategy", { allocPct: pct }));
+    } catch (e) {
+      console.error(e);
+    }
+  }, []);
+
+  const persistAlloc = useCallback(async (pct: number) => {
+    try {
+      await invoke("set_debt_alloc_pct", { pct });
     } catch (e) {
       console.error(e);
     }
@@ -256,6 +288,177 @@ export function CreditsWidget() {
             <p className="text-[11px] text-muted-foreground">Переплата (прогноз)</p>
             <p className="text-lg font-bold text-amber-400 leading-tight">{formatCurrency(overpayTotal)}</p>
           </div>
+        </div>
+      )}
+
+      {/* Debt strategy */}
+      {debtStrategy?.has_loans && (
+        <div className="rounded-xl border border-sky-500/25 bg-sky-500/5 p-4 space-y-3">
+          <h4 className="flex items-center gap-2 text-sm font-medium">
+            <Rocket className="h-4 w-4 text-sky-400" />
+            Стратегия погашения
+            <span className="text-[10px] text-muted-foreground font-normal ml-1">метод «лавина» · режим «сократить срок»</span>
+          </h4>
+
+          {debtStrategy.card_alert && (
+            <div className="flex items-start gap-2 rounded-lg border border-red-500/30 bg-red-500/10 px-3 py-2">
+              <AlertTriangle className="h-4 w-4 text-red-400 shrink-0 mt-0.5" />
+              <p className="text-xs text-red-400">{debtStrategy.card_alert}</p>
+            </div>
+          )}
+
+          {/* Ползунок: доля свободных денег на досрочку */}
+          <div className="flex items-center gap-3">
+            <span className="text-xs text-muted-foreground shrink-0">На досрочку:</span>
+            <input
+              type="range"
+              min={0} max={100} step={5}
+              value={allocPct ?? debtStrategy.alloc_pct}
+              onChange={(e) => previewAlloc(parseInt(e.target.value))}
+              onMouseUp={(e) => persistAlloc(parseInt((e.target as HTMLInputElement).value))}
+              onTouchEnd={(e) => persistAlloc(parseInt((e.target as HTMLInputElement).value))}
+              className="flex-1 accent-sky-400 cursor-pointer"
+            />
+            <span className="text-xs font-medium w-24 text-right shrink-0">
+              {allocPct ?? debtStrategy.alloc_pct}%
+              <span className="text-muted-foreground font-normal"> свободных</span>
+            </span>
+          </div>
+
+          {debtStrategy.extra_available > 0 && debtStrategy.target ? (
+            <>
+              <p className="text-sm">
+                Свободно для досрочки: <span className="font-bold text-emerald-400">{formatCurrency(debtStrategy.extra_available)}/мес</span>
+                <span className="text-xs text-muted-foreground ml-2">
+                  (поток {formatCurrency(debtStrategy.monthly_flow)} − недельный запас {formatCurrency(debtStrategy.buffer)})
+                </span>
+              </p>
+              <p className="text-sm">
+                Направляйте в <span className="font-medium text-sky-400">«{debtStrategy.target.name}»</span>
+                <span className="text-xs text-muted-foreground ml-1.5">— {debtStrategy.target.reason}</span>
+              </p>
+
+              <div className="grid grid-cols-3 gap-3 pt-1">
+                <div className="rounded-lg bg-background/40 p-2.5">
+                  <p className="text-[10px] text-muted-foreground">Экономия на процентах</p>
+                  <p className="text-base font-bold text-emerald-400">{formatCurrency(debtStrategy.saved_interest)}</p>
+                </div>
+                <div className="rounded-lg bg-background/40 p-2.5">
+                  <p className="text-[10px] text-muted-foreground">Быстрее на</p>
+                  <p className="text-base font-bold text-sky-400">{debtStrategy.months_saved} мес.</p>
+                </div>
+                <div className="rounded-lg bg-background/40 p-2.5">
+                  <p className="text-[10px] text-muted-foreground">Свобода от долгов</p>
+                  <p className="text-base font-bold text-foreground">
+                    {debtStrategy.strategy.debt_free_date ? formatDate(debtStrategy.strategy.debt_free_date) : "—"}
+                  </p>
+                  {debtStrategy.baseline.debt_free_date && (
+                    <p className="text-[10px] text-muted-foreground line-through">
+                      {formatDate(debtStrategy.baseline.debt_free_date)}
+                    </p>
+                  )}
+                </div>
+              </div>
+            </>
+          ) : (
+            <p className="text-xs text-muted-foreground">
+              {debtStrategy.limit_reason ?? "Досрочное погашение сейчас недоступно."}
+            </p>
+          )}
+
+          {/* Траектории долга: без досрочки vs со стратегией (с учётом планов и будущих периодов) */}
+          {debtStrategy.chart.length > 2 && (
+            <div className="pt-1">
+              <ResponsiveContainer width="100%" height={150}>
+                <AreaChart
+                  data={debtStrategy.chart.map(p => ({
+                    ...p,
+                    label: `${p.date.slice(5, 7)}.${p.date.slice(2, 4)}`,
+                  }))}
+                  margin={{ left: 0, right: 8 }}
+                  style={{ cursor: "pointer" }}
+                  onClick={(st: { activePayload?: Array<{ payload?: { date?: string } }> } | null) => {
+                    const date = st?.activePayload?.[0]?.payload?.date;
+                    if (!date || !debtStrategy) return;
+                    // chart[0] = сегодня (без платежей), monthly_plan[m-1] = месяц m
+                    const idx = debtStrategy.chart.findIndex(p => p.date === date);
+                    if (idx > 0 && debtStrategy.monthly_plan[idx - 1]) {
+                      setMonthDetail(debtStrategy.monthly_plan[idx - 1]);
+                    }
+                  }}
+                >
+                  <defs>
+                    <linearGradient id="debtStratGrad" x1="0" y1="0" x2="0" y2="1">
+                      <stop offset="5%" stopColor="#38bdf8" stopOpacity={0.25} />
+                      <stop offset="95%" stopColor="#38bdf8" stopOpacity={0} />
+                    </linearGradient>
+                  </defs>
+                  <CartesianGrid strokeDasharray="3 3" stroke={chartColors.grid} />
+                  <XAxis
+                    dataKey="label"
+                    tick={{ fill: chartColors.tick, fontSize: 10 }}
+                    axisLine={false} tickLine={false}
+                    interval="preserveStartEnd" minTickGap={28}
+                  />
+                  <YAxis
+                    tickFormatter={(v) => `${(v / 1000).toFixed(0)}к`}
+                    tick={{ fill: chartColors.tick, fontSize: 10 }}
+                    axisLine={false} tickLine={false} width={44}
+                  />
+                  <Tooltip
+                    contentStyle={{
+                      background: chartColors.tooltipBg,
+                      border: `1px solid ${chartColors.tooltipBorder}`,
+                      borderRadius: 10, fontSize: 12, color: chartColors.tooltipText,
+                    }}
+                    itemStyle={{ color: chartColors.tooltipText }}
+                    labelStyle={{ color: chartColors.tooltipMuted }}
+                    formatter={(v: number, name: string) => [
+                      formatCurrency(v),
+                      name === "baseline" ? "Без досрочки" : "Со стратегией",
+                    ]}
+                  />
+                  <Area
+                    type="monotone" dataKey="baseline" name="baseline"
+                    stroke={chartColors.tick} strokeWidth={1.5} strokeDasharray="5 4"
+                    fill="none"
+                  />
+                  <Area
+                    type="monotone" dataKey="strategy" name="strategy"
+                    stroke="#38bdf8" strokeWidth={2}
+                    fill="url(#debtStratGrad)"
+                  />
+                </AreaChart>
+              </ResponsiveContainer>
+              <div className="flex items-center justify-between text-[10px] text-muted-foreground">
+                <span>нажмите на месяц — план платежей</span>
+                <span className="flex items-center gap-4">
+                  <span className="flex items-center gap-1.5">
+                    <span className="inline-block w-4 border-t border-dashed" style={{ borderColor: chartColors.tick }} />
+                    без досрочки
+                  </span>
+                  <span className="flex items-center gap-1.5">
+                    <span className="inline-block w-4 border-t-2" style={{ borderColor: "#38bdf8" }} />
+                    со стратегией (учтены планы и прогноз)
+                  </span>
+                </span>
+              </div>
+            </div>
+          )}
+
+          {/* Порядок гашения */}
+          {debtStrategy.order.length > 1 && (
+            <div className="flex items-center gap-2 flex-wrap pt-1">
+              <span className="text-[10px] text-muted-foreground">Порядок:</span>
+              {debtStrategy.order.map((o, i) => (
+                <span key={o.name} className="flex items-center gap-1 px-2 py-0.5 rounded-full border border-border/60 text-[11px]">
+                  <span className="text-muted-foreground">{i + 1}.</span>
+                  {o.name}
+                  <span className="text-muted-foreground">({o.rate_annual}%)</span>
+                </span>
+              ))}
+            </div>
+          )}
         </div>
       )}
 
@@ -567,6 +770,53 @@ export function CreditsWidget() {
           </div>
         </div>
       )}
+
+      {/* Month plan modal (клик по графику стратегии) */}
+      {monthDetail && (() => {
+        const MONTHS_RU = ["январь","февраль","март","апрель","май","июнь","июль","август","сентябрь","октябрь","ноябрь","декабрь"];
+        const d = new Date(monthDetail.date + "T00:00:00");
+        const title = `${MONTHS_RU[d.getMonth()]} ${d.getFullYear()}`;
+        const activeItems = monthDetail.items.filter(i => i.scheduled > 0 || i.extra > 0 || i.balance_after > 0);
+        return (
+          <div className="fixed inset-0 z-50 flex items-center justify-center bg-background/70 backdrop-blur-sm" onClick={() => setMonthDetail(null)}>
+            <div className="bg-card border border-border rounded-2xl shadow-2xl w-[26rem] max-h-[75vh] flex flex-col" onClick={(e) => e.stopPropagation()}>
+              <div className="px-5 py-3 border-b border-border">
+                <h3 className="text-sm font-semibold">План на {title}</h3>
+                <p className="text-[11px] text-muted-foreground mt-0.5">
+                  {monthDetail.total_extra > 0
+                    ? <>Дополнительно к платежам: <span className="text-emerald-400 font-medium">{formatCurrency(monthDetail.total_extra)}</span></>
+                    : "В этом месяце только плановые платежи, без досрочки"}
+                </p>
+              </div>
+              <div className="overflow-y-auto flex-1 px-5 py-2">
+                {activeItems.map(item => (
+                  <div key={item.name} className={cn(
+                    "flex items-center gap-3 py-2 border-b border-border/30 last:border-0",
+                    item.extra > 0 && "bg-sky-500/5 -mx-2 px-2 rounded"
+                  )}>
+                    <div className="min-w-0 flex-1">
+                      <p className="text-xs font-medium truncate">{item.name}</p>
+                      <p className="text-[10px] text-muted-foreground">
+                        остаток после: {formatCurrency(item.balance_after)}
+                        {item.balance_after < 0.01 && <span className="text-emerald-400 ml-1">· закрыт 🎉</span>}
+                      </p>
+                    </div>
+                    <div className="text-right shrink-0">
+                      <p className="text-xs">{item.scheduled > 0 ? formatCurrency(item.scheduled) : "—"}</p>
+                      {item.extra > 0 && (
+                        <p className="text-xs font-bold text-emerald-400">+{formatCurrency(item.extra)} досрочно</p>
+                      )}
+                    </div>
+                  </div>
+                ))}
+              </div>
+              <div className="px-5 py-3 border-t border-border flex justify-end">
+                <button onClick={() => setMonthDetail(null)} className="px-4 py-1.5 rounded-lg border border-border text-xs hover:bg-accent transition-colors">Закрыть</button>
+              </div>
+            </div>
+          </div>
+        );
+      })()}
 
       {/* Delete confirm */}
       {deleteId !== null && (
