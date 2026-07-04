@@ -71,6 +71,127 @@ export interface Kopilka {
   aliases: string[];
 }
 
+export interface Credit {
+  id: number;
+  name: string;
+  kind: 'loan' | 'card';
+  bank: string;
+  principal: number;            // loan: сумма кредита; card: кредитный лимит
+  current_balance: number;      // живой остаток долга
+  rate_annual: number;
+  term_months?: number | null;
+  scheduled_payment?: number | null;
+  payment_day?: number | null;
+  start_date: string;
+  grace_days?: number | null;
+  statement_day?: number | null;
+  min_payment_pct?: number | null;
+  archived: boolean;
+  created_at: string;
+}
+
+export interface CreditStatus {
+  credit: Credit;
+  progress_pct: number;
+  paid_principal: number;
+  paid_interest: number;
+  // loan
+  next_payment_amount?: number | null;
+  next_payment_date?: string | null;
+  payoff_date?: string | null;
+  months_left?: number | null;
+  interest_left?: number | null;
+  // card
+  available?: number | null;
+  utilization_pct?: number | null;
+  min_payment?: number | null;
+  grace_until?: string | null;
+  grace_days_left?: number | null;
+}
+
+export interface CreditPayment {
+  id: number;
+  credit_id: number;
+  date: string;
+  amount: number;
+  interest_part: number;
+  principal_part: number;
+  kind: 'payment' | 'charge' | 'adjust';
+  balance_after: number;
+  note: string;
+  created_at: string;
+}
+
+export interface ScheduleRow {
+  n: number;
+  date?: string | null;
+  payment: number;
+  interest: number;
+  principal: number;
+  balance_after: number;
+}
+
+export interface NetWorthParts {
+  kopilka_total: number;
+  credit_debt: number;
+}
+
+export interface MonthCompareRow {
+  category: string;
+  current: number;
+  previous: number;
+  delta: number;
+  pct?: number | null;
+}
+
+export interface MonthComparison {
+  current_label: string;
+  previous_label: string;
+  total_current: number;
+  total_previous: number;
+  rows: MonthCompareRow[];
+  has_previous: boolean;
+}
+
+export interface ForecastPoint {
+  date: string;
+  balance: number;
+  event?: string | null;
+}
+
+export interface CashForecast {
+  points: ForecastPoint[];
+  min_balance: number;
+  min_date: string;
+  has_gap: boolean;
+  daily_avg: number;
+}
+
+export interface Reminder {
+  kind: 'loan_payment' | 'grace_expiry';
+  title: string;
+  body: string;
+  key: string;
+}
+
+export interface PlannedItem {
+  id: number;
+  name: string;
+  amount: number;
+  date: string;
+  kind: 'expense' | 'income';
+  created_at: string;
+}
+
+export interface CreditPaymentCandidate {
+  tx_id: number;
+  date: string;
+  amount: number;
+  description: string;
+  credit_id: number;
+  credit_name: string;
+}
+
 export interface GoalProgress {
   goal: Goal;
   spent: number;

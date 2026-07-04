@@ -208,6 +208,80 @@ pub fn known_hashes(conn: &Connection) -> Result<std::collections::HashSet<Strin
     Ok(rows.filter_map(|r| r.ok()).collect())
 }
 
+/// Сигнатуры существующих транзакций для ловли дублей с усечённым описанием:
+/// банк в разных выгрузках обрезает описание по-разному, поэтому tx_hash не совпадает.
+/// Возвращает (date, amount, description в нижнем регистре).
+pub fn known_signatures(conn: &Connection) -> Result<Vec<(String, f64, String)>> {
+    let mut stmt = conn.prepare("SELECT date, amount, LOWER(description) FROM transactions")?;
+    let rows: Vec<(String, f64, String)> = stmt
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+        .filter_map(|r| r.ok())
+        .collect();
+    Ok(rows)
+}
+
+/// Одноразовая чистка дублей от разных выгрузок банка: та же дата и сумма,
+/// одно описание — начало другого (банк обрезал по-разному). Оставляем
+/// транзакцию с более полным описанием, укороченную удаляем.
+pub fn dedupe_truncated_descriptions(conn: &Connection) -> Result<usize> {
+    let done = conn.query_row(
+        "SELECT value FROM settings WHERE key = 'dedup_truncated_v1'",
+        [],
+        |row| row.get::<_, String>(0),
+    ).map(|v| v == "1").unwrap_or(false);
+    if done { return Ok(0); }
+
+    let rows: Vec<(i64, String, f64, i64, String)> = {
+        let mut stmt = conn.prepare("SELECT id, date, amount, is_income, description FROM transactions")?;
+        let v: Vec<(i64, String, f64, i64, String)> = stmt
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)))?
+            .filter_map(|r| r.ok())
+            .collect();
+        v
+    };
+
+    // Группировка: дата + сумма (в копейках) + направление
+    let mut groups: std::collections::HashMap<(String, i64, i64), Vec<(i64, String)>> =
+        std::collections::HashMap::new();
+    for (id, date, amount, is_income, desc) in rows {
+        groups
+            .entry((date, (amount * 100.0).round() as i64, is_income))
+            .or_default()
+            .push((id, desc));
+    }
+
+    let mut to_delete: Vec<i64> = Vec::new();
+    for group in groups.values() {
+        if group.len() < 2 { continue; }
+        // Держим самые длинные описания, укороченные префиксы удаляем
+        let mut sorted = group.clone();
+        sorted.sort_by(|a, b| b.1.len().cmp(&a.1.len()));
+        let mut kept: Vec<String> = Vec::new();
+        for (id, desc) in sorted {
+            let dl = desc.to_lowercase();
+            let is_dup = kept.iter().any(|kl| {
+                let min = dl.len().min(kl.len());
+                min >= 8 && (kl.starts_with(&dl) || dl.starts_with(kl.as_str()))
+            });
+            if is_dup {
+                to_delete.push(id);
+            } else {
+                kept.push(dl);
+            }
+        }
+    }
+
+    for id in &to_delete {
+        conn.execute("DELETE FROM transactions WHERE id=?1", params![id])?;
+    }
+    conn.execute(
+        "INSERT INTO settings(key,value) VALUES('dedup_truncated_v1','1')
+         ON CONFLICT(key) DO UPDATE SET value='1'",
+        [],
+    )?;
+    Ok(to_delete.len())
+}
+
 pub fn known_merchant_keys(conn: &Connection) -> Result<Vec<String>> {
     let mut stmt = conn.prepare("SELECT merchant_key FROM merchant_cache")?;
     let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
@@ -604,6 +678,378 @@ pub fn init_goals(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+// ─── Credits ──────────────────────────────────────────────────────────────────
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct Credit {
+    pub id: i64,
+    pub name: String,
+    pub kind: String,                 // 'loan' | 'card'
+    pub bank: String,
+    pub principal: f64,               // loan: сумма кредита; card: кредитный лимит
+    pub current_balance: f64,         // живой остаток долга
+    pub rate_annual: f64,
+    pub term_months: Option<i64>,     // loan
+    pub scheduled_payment: Option<f64>, // loan: текущий аннуитетный платёж
+    pub payment_day: Option<i64>,
+    pub start_date: String,
+    pub grace_days: Option<i64>,      // card
+    pub statement_day: Option<i64>,   // card
+    pub min_payment_pct: Option<f64>, // card
+    pub archived: bool,
+    pub created_at: String,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct CreditPayment {
+    pub id: i64,
+    pub credit_id: i64,
+    pub date: String,
+    pub amount: f64,
+    pub interest_part: f64,
+    pub principal_part: f64,
+    pub kind: String,                 // 'payment' | 'charge' | 'adjust'
+    pub balance_after: f64,
+    pub note: String,
+    pub created_at: String,
+}
+
+pub fn init_credits(conn: &Connection) -> Result<()> {
+    conn.execute_batch("
+        CREATE TABLE IF NOT EXISTS credits (
+            id                INTEGER PRIMARY KEY AUTOINCREMENT,
+            name              TEXT NOT NULL,
+            kind              TEXT NOT NULL,
+            bank              TEXT NOT NULL DEFAULT '',
+            principal         REAL NOT NULL,
+            current_balance   REAL NOT NULL,
+            rate_annual       REAL NOT NULL,
+            term_months       INTEGER,
+            scheduled_payment REAL,
+            payment_day       INTEGER,
+            start_date        TEXT NOT NULL,
+            grace_days        INTEGER,
+            statement_day     INTEGER,
+            min_payment_pct   REAL,
+            archived          INTEGER NOT NULL DEFAULT 0,
+            created_at        TEXT NOT NULL DEFAULT (datetime('now'))
+        );
+        CREATE TABLE IF NOT EXISTS credit_payments (
+            id             INTEGER PRIMARY KEY AUTOINCREMENT,
+            credit_id      INTEGER NOT NULL REFERENCES credits(id) ON DELETE CASCADE,
+            date           TEXT NOT NULL,
+            amount         REAL NOT NULL,
+            interest_part  REAL NOT NULL DEFAULT 0,
+            principal_part REAL NOT NULL DEFAULT 0,
+            kind           TEXT NOT NULL,
+            balance_after  REAL NOT NULL,
+            note           TEXT NOT NULL DEFAULT '',
+            created_at     TEXT NOT NULL DEFAULT (datetime('now'))
+        );
+    ")?;
+    Ok(())
+}
+
+pub fn get_credits(conn: &Connection) -> Result<Vec<Credit>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, name, kind, bank, principal, current_balance, rate_annual, term_months,
+                scheduled_payment, payment_day, start_date, grace_days, statement_day,
+                min_payment_pct, archived, created_at
+         FROM credits ORDER BY archived ASC, created_at DESC"
+    )?;
+    let rows = stmt.query_map([], |row| {
+        Ok(Credit {
+            id:                row.get(0)?,
+            name:              row.get(1)?,
+            kind:              row.get(2)?,
+            bank:              row.get(3)?,
+            principal:         row.get(4)?,
+            current_balance:   row.get(5)?,
+            rate_annual:       row.get(6)?,
+            term_months:       row.get(7)?,
+            scheduled_payment: row.get(8)?,
+            payment_day:       row.get(9)?,
+            start_date:        row.get(10)?,
+            grace_days:        row.get(11)?,
+            statement_day:     row.get(12)?,
+            min_payment_pct:   row.get(13)?,
+            archived:          row.get::<_, i64>(14)? != 0,
+            created_at:        row.get(15)?,
+        })
+    })?;
+    Ok(rows.filter_map(|r| r.ok()).collect())
+}
+
+pub fn get_credit(conn: &Connection, id: i64) -> Result<Option<Credit>> {
+    Ok(get_credits(conn)?.into_iter().find(|c| c.id == id))
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn create_credit(
+    conn: &Connection,
+    name: &str,
+    kind: &str,
+    bank: &str,
+    principal: f64,
+    current_balance: f64,
+    rate_annual: f64,
+    term_months: Option<i64>,
+    scheduled_payment: Option<f64>,
+    payment_day: Option<i64>,
+    start_date: &str,
+    grace_days: Option<i64>,
+    statement_day: Option<i64>,
+    min_payment_pct: Option<f64>,
+) -> Result<i64> {
+    conn.execute(
+        "INSERT INTO credits
+            (name, kind, bank, principal, current_balance, rate_annual, term_months,
+             scheduled_payment, payment_day, start_date, grace_days, statement_day, min_payment_pct)
+         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)",
+        params![name, kind, bank, principal, current_balance, rate_annual, term_months,
+                scheduled_payment, payment_day, start_date, grace_days, statement_day, min_payment_pct],
+    )?;
+    Ok(conn.last_insert_rowid())
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn update_credit(
+    conn: &Connection,
+    id: i64,
+    name: &str,
+    bank: &str,
+    principal: f64,
+    current_balance: f64,
+    rate_annual: f64,
+    term_months: Option<i64>,
+    scheduled_payment: Option<f64>,
+    payment_day: Option<i64>,
+    start_date: &str,
+    grace_days: Option<i64>,
+    statement_day: Option<i64>,
+    min_payment_pct: Option<f64>,
+) -> Result<()> {
+    conn.execute(
+        "UPDATE credits SET name=?2, bank=?3, principal=?4, current_balance=?5, rate_annual=?6,
+             term_months=?7, scheduled_payment=?8, payment_day=?9, start_date=?10,
+             grace_days=?11, statement_day=?12, min_payment_pct=?13
+         WHERE id=?1",
+        params![id, name, bank, principal, current_balance, rate_annual, term_months,
+                scheduled_payment, payment_day, start_date, grace_days, statement_day, min_payment_pct],
+    )?;
+    Ok(())
+}
+
+pub fn delete_credit(conn: &Connection, id: i64) -> Result<()> {
+    conn.execute("DELETE FROM credit_payments WHERE credit_id = ?1", params![id])?;
+    conn.execute("DELETE FROM credits WHERE id = ?1", params![id])?;
+    Ok(())
+}
+
+pub fn set_credit_archived(conn: &Connection, id: i64, archived: bool) -> Result<()> {
+    conn.execute(
+        "UPDATE credits SET archived=?2 WHERE id=?1",
+        params![id, if archived { 1 } else { 0 }],
+    )?;
+    Ok(())
+}
+
+/// Записать операцию в журнал и обновить остаток (и, при необходимости, плановый платёж).
+#[allow(clippy::too_many_arguments)]
+pub fn add_credit_payment(
+    conn: &Connection,
+    credit_id: i64,
+    date: &str,
+    amount: f64,
+    interest_part: f64,
+    principal_part: f64,
+    kind: &str,
+    balance_after: f64,
+    new_scheduled_payment: Option<f64>,
+    note: &str,
+) -> Result<i64> {
+    conn.execute(
+        "INSERT INTO credit_payments
+            (credit_id, date, amount, interest_part, principal_part, kind, balance_after, note)
+         VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",
+        params![credit_id, date, amount, interest_part, principal_part, kind, balance_after, note],
+    )?;
+    conn.execute(
+        "UPDATE credits SET current_balance=?2 WHERE id=?1",
+        params![credit_id, balance_after],
+    )?;
+    if let Some(sp) = new_scheduled_payment {
+        conn.execute(
+            "UPDATE credits SET scheduled_payment=?2 WHERE id=?1",
+            params![credit_id, sp],
+        )?;
+    }
+    // Кредит погашен — в архив.
+    if balance_after <= 0.005 {
+        conn.execute("UPDATE credits SET archived=1 WHERE id=?1", params![credit_id])?;
+    }
+    Ok(conn.last_insert_rowid())
+}
+
+#[derive(Debug, Serialize)]
+pub struct CreditPaymentCandidate {
+    pub tx_id: i64,
+    pub date: String,
+    pub amount: f64,
+    pub description: String,
+    pub credit_id: i64,
+    pub credit_name: String,
+}
+
+/// Найти в последнем импорте расходные транзакции, похожие на платежи по кредиту:
+/// сумма ≈ плановому платежу активного кредита (±2%) или явное описание погашения.
+/// Уже записанные платежи (та же дата и сумма) отфильтровываются.
+pub fn find_credit_payment_candidates(conn: &Connection) -> Result<Vec<CreditPaymentCandidate>> {
+    let latest_import: Option<i64> = conn.query_row(
+        "SELECT id FROM imports ORDER BY id DESC LIMIT 1", [], |r| r.get(0),
+    ).ok();
+    let import_id = match latest_import { Some(id) => id, None => return Ok(vec![]) };
+
+    let loans: Vec<(i64, String, f64)> = get_credits(conn)?
+        .into_iter()
+        .filter(|c| !c.archived && c.kind == "loan" && c.scheduled_payment.unwrap_or(0.0) > 0.0)
+        .map(|c| (c.id, c.name, c.scheduled_payment.unwrap()))
+        .collect();
+    if loans.is_empty() { return Ok(vec![]); }
+
+    let txs: Vec<(i64, String, f64, String)> = {
+        let mut stmt = conn.prepare(
+            "SELECT id, date, amount, description FROM transactions
+             WHERE import_id=?1 AND is_income=0"
+        )?;
+        let v: Vec<(i64, String, f64, String)> = stmt
+            .query_map([import_id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?
+            .filter_map(|r| r.ok())
+            .collect();
+        v
+    };
+
+    let mut result = Vec::new();
+    for (tx_id, date, amount, description) in txs {
+        let desc_lc = description.to_lowercase();
+        let desc_match = desc_lc.contains("погашение кредит") || desc_lc.contains("платеж по кредит")
+            || desc_lc.contains("платёж по кредит");
+
+        // Кредит с ближайшим плановым платежом
+        let best = loans.iter()
+            .map(|(id, name, sched)| (id, name, sched, (amount - sched).abs() / sched))
+            .min_by(|a, b| a.3.partial_cmp(&b.3).unwrap_or(std::cmp::Ordering::Equal));
+        let Some((credit_id, credit_name, _sched, rel_diff)) = best else { continue };
+
+        if rel_diff > 0.02 && !desc_match { continue; }
+
+        // Защита от дублей: платёж с той же датой и суммой уже записан
+        let already: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM credit_payments
+             WHERE credit_id=?1 AND date=?2 AND ABS(amount - ?3) < 0.01",
+            params![credit_id, &date, amount],
+            |r| r.get(0),
+        ).unwrap_or(0);
+        if already > 0 { continue; }
+
+        result.push(CreditPaymentCandidate {
+            tx_id,
+            date,
+            amount,
+            description,
+            credit_id: *credit_id,
+            credit_name: credit_name.clone(),
+        });
+    }
+    Ok(result)
+}
+
+pub fn get_credit_payments(conn: &Connection, credit_id: i64) -> Result<Vec<CreditPayment>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, credit_id, date, amount, interest_part, principal_part, kind, balance_after, note, created_at
+         FROM credit_payments WHERE credit_id=?1 ORDER BY date DESC, id DESC"
+    )?;
+    let rows = stmt.query_map([credit_id], |row| {
+        Ok(CreditPayment {
+            id:             row.get(0)?,
+            credit_id:      row.get(1)?,
+            date:           row.get(2)?,
+            amount:         row.get(3)?,
+            interest_part:  row.get(4)?,
+            principal_part: row.get(5)?,
+            kind:           row.get(6)?,
+            balance_after:  row.get(7)?,
+            note:           row.get(8)?,
+            created_at:     row.get(9)?,
+        })
+    })?;
+    Ok(rows.filter_map(|r| r.ok()).collect())
+}
+
+// ─── Planned items ────────────────────────────────────────────────────────────
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct PlannedItem {
+    pub id: i64,
+    pub name: String,
+    pub amount: f64,
+    pub date: String,
+    pub kind: String, // 'expense' | 'income'
+    pub created_at: String,
+}
+
+pub fn init_planned(conn: &Connection) -> Result<()> {
+    conn.execute_batch("
+        CREATE TABLE IF NOT EXISTS planned_items (
+            id         INTEGER PRIMARY KEY AUTOINCREMENT,
+            name       TEXT NOT NULL,
+            amount     REAL NOT NULL,
+            date       TEXT NOT NULL,
+            kind       TEXT NOT NULL DEFAULT 'expense',
+            created_at TEXT NOT NULL DEFAULT (datetime('now'))
+        );
+    ")?;
+    Ok(())
+}
+
+pub fn get_planned_items(conn: &Connection) -> Result<Vec<PlannedItem>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, name, amount, date, kind, created_at FROM planned_items ORDER BY date ASC"
+    )?;
+    let rows = stmt.query_map([], |row| {
+        Ok(PlannedItem {
+            id:         row.get(0)?,
+            name:       row.get(1)?,
+            amount:     row.get(2)?,
+            date:       row.get(3)?,
+            kind:       row.get(4)?,
+            created_at: row.get(5)?,
+        })
+    })?;
+    Ok(rows.filter_map(|r| r.ok()).collect())
+}
+
+pub fn create_planned_item(conn: &Connection, name: &str, amount: f64, date: &str, kind: &str) -> Result<i64> {
+    conn.execute(
+        "INSERT INTO planned_items (name, amount, date, kind) VALUES (?1, ?2, ?3, ?4)",
+        params![name, amount, date, kind],
+    )?;
+    Ok(conn.last_insert_rowid())
+}
+
+pub fn update_planned_item(conn: &Connection, id: i64, name: &str, amount: f64, date: &str, kind: &str) -> Result<()> {
+    conn.execute(
+        "UPDATE planned_items SET name=?2, amount=?3, date=?4, kind=?5 WHERE id=?1",
+        params![id, name, amount, date, kind],
+    )?;
+    Ok(())
+}
+
+pub fn delete_planned_item(conn: &Connection, id: i64) -> Result<()> {
+    conn.execute("DELETE FROM planned_items WHERE id=?1", params![id])?;
+    Ok(())
+}
+
 // ─── Kopilkas ─────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Serialize, Clone)]
@@ -673,30 +1119,43 @@ pub fn add_kopilka_alias(conn: &Connection, kopilka_id: i64, alias: &str) -> Res
 }
 
 /// Find unique income transaction descriptions not yet matched to any kopilka alias.
-/// Returns Vec<(description, count)> sorted by frequency (most common first, up to 20).
-pub fn find_unmatched_kopilka_descriptions(conn: &Connection) -> Result<Vec<(String, i64)>> {
+/// Returns Vec<(description, count, total_amount)> sorted by total amount (largest first, up to 20).
+pub fn find_unmatched_kopilka_descriptions(conn: &Connection) -> Result<Vec<(String, i64, f64)>> {
     let known_aliases: Vec<String> = {
         let mut s = conn.prepare("SELECT LOWER(alias) FROM kopilka_aliases")?;
         let v: Vec<String> = s.query_map([], |r| r.get::<_, String>(0))?.filter_map(|r| r.ok()).collect();
         v
     };
     let mut stmt = conn.prepare(
-        "SELECT description, COUNT(*) as cnt
+        "SELECT description, COUNT(*) as cnt, COALESCE(SUM(amount), 0) as total
          FROM transactions
          WHERE is_income=1
          GROUP BY description
-         ORDER BY cnt DESC
+         ORDER BY total DESC
          LIMIT 20"
     )?;
-    let rows: Vec<(String, i64)> = stmt
-        .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))?
+    let rows: Vec<(String, i64, f64)> = stmt
+        .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?, r.get::<_, f64>(2)?)))?
         .filter_map(|r| r.ok())
-        .filter(|(desc, _)| {
+        .filter(|(desc, _, _)| {
             let d = desc.to_lowercase();
             !known_aliases.iter().any(|a| d.contains(a.as_str()))
         })
         .collect();
     Ok(rows)
+}
+
+/// Сумма накоплений: депозиты (is_income=1) из импортов, помеченных копилкой.
+pub fn get_kopilka_saved_total(conn: &Connection) -> Result<f64> {
+    let total: f64 = conn.query_row(
+        "SELECT COALESCE(SUM(t.amount), 0)
+         FROM transactions t
+         JOIN imports i ON t.import_id = i.id
+         WHERE i.kopilka_id IS NOT NULL AND t.is_income = 1",
+        [],
+        |r| r.get(0),
+    )?;
+    Ok(total)
 }
 
 pub fn get_goals(conn: &Connection) -> Result<Vec<Goal>> {

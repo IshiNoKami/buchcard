@@ -1,6 +1,6 @@
 import { useState } from "react";
 import { Transaction, Category } from "@/lib/types";
-import { formatCurrency } from "@/lib/utils";
+import { formatCurrency, formatDate } from "@/lib/utils";
 import { useChartColors } from "@/lib/theme";
 import { X } from "lucide-react";
 import {
@@ -220,6 +220,7 @@ export function TopMerchantsBar({ transactions }: { transactions: Transaction[] 
 
 export function DailyArea({ transactions }: { transactions: Transaction[] }) {
   const c = useChartColors();
+  const [selectedDay, setSelectedDay] = useState<string | null>(null);
 
   const byDate = transactions
     .filter((t) => !t.is_income)
@@ -230,7 +231,14 @@ export function DailyArea({ transactions }: { transactions: Transaction[] }) {
 
   const data = Object.entries(byDate)
     .sort((a, b) => a[0].localeCompare(b[0]))
-    .map(([date, amount]) => ({ date: date.slice(5), amount }));
+    .map(([date, amount]) => ({ date: date.slice(5), full: date, amount }));
+
+  const dayTxs = selectedDay
+    ? transactions
+        .filter((t) => !t.is_income && t.date === selectedDay)
+        .sort((a, b) => b.amount - a.amount)
+    : [];
+  const dayTotal = dayTxs.reduce((s, t) => s + t.amount, 0);
 
   const avg = data.reduce((s, d) => s + d.amount, 0) / (data.length || 1);
 
@@ -249,7 +257,15 @@ export function DailyArea({ transactions }: { transactions: Transaction[] }) {
         <span className="text-xs text-muted-foreground">среднее: {formatCurrency(avg)}/день</span>
       </div>
       <ResponsiveContainer width="100%" height={180}>
-        <AreaChart data={data} margin={{ left: 0, right: 0 }}>
+        <AreaChart
+          data={data}
+          margin={{ left: 0, right: 0 }}
+          style={{ cursor: "pointer" }}
+          onClick={(st: { activePayload?: Array<{ payload?: { full?: string } }> } | null) => {
+            const full = st?.activePayload?.[0]?.payload?.full;
+            if (full) setSelectedDay(full);
+          }}
+        >
           <defs>
             <linearGradient id="areaGrad" x1="0" y1="0" x2="0" y2="1">
               <stop offset="5%"  stopColor={c.primary} stopOpacity={0.3} />
@@ -281,6 +297,49 @@ export function DailyArea({ transactions }: { transactions: Transaction[] }) {
           />
         </AreaChart>
       </ResponsiveContainer>
+      <p className="text-[10px] text-muted-foreground/60 mt-1 text-right">нажмите на день, чтобы увидеть траты</p>
+
+      {/* Day details modal */}
+      {selectedDay && (
+        <div
+          className="fixed inset-0 z-50 flex items-center justify-center bg-background/60 backdrop-blur-sm"
+          onClick={() => setSelectedDay(null)}
+        >
+          <div
+            className="bg-card border border-border rounded-2xl shadow-2xl w-[26rem] max-h-[70vh] flex flex-col"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div className="flex items-center justify-between px-5 py-3 border-b border-border">
+              <div>
+                <h3 className="text-sm font-semibold">Траты за {formatDate(selectedDay)}</h3>
+                <p className="text-[11px] text-muted-foreground mt-0.5">
+                  {dayTxs.length} операц. · итого <span className="text-foreground font-medium">{formatCurrency(dayTotal)}</span>
+                </p>
+              </div>
+              <button
+                onClick={() => setSelectedDay(null)}
+                className="rounded-md p-1 hover:bg-accent text-muted-foreground hover:text-foreground transition-colors"
+              >
+                <X className="h-4 w-4" />
+              </button>
+            </div>
+            <div className="overflow-y-auto flex-1 px-5 py-2">
+              {dayTxs.map((t) => (
+                <div key={t.tx_hash} className="flex items-start gap-3 py-2 border-b border-border/30 last:border-0">
+                  <div className="min-w-0 flex-1">
+                    <p className="text-xs truncate">{t.merchant_key || t.description.slice(0, 50)}</p>
+                    <p className="text-[10px] text-muted-foreground truncate">{t.category}</p>
+                  </div>
+                  <span className="text-xs font-medium shrink-0">{formatCurrency(t.amount)}</span>
+                </div>
+              ))}
+              {dayTxs.length === 0 && (
+                <p className="text-xs text-muted-foreground py-4 text-center">Нет расходов в этот день</p>
+              )}
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }

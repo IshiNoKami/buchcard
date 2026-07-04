@@ -86,11 +86,31 @@ pub fn parse_xls(filepath: &Path) -> Result<Vec<Transaction>> {
     Ok(rows)
 }
 
+/// Одно описание — начало другого (банк по-разному обрезает в разных выгрузках).
+/// Минимум 8 общих символов, чтобы не склеивать случайные совпадения.
+fn is_truncation_pair(a: &str, b: &str) -> bool {
+    let min = a.len().min(b.len());
+    min >= 8 && (a.starts_with(b) || b.starts_with(a))
+}
+
 pub fn filter_new(
     txs: Vec<Transaction>,
     existing_hashes: &std::collections::HashSet<String>,
+    existing_sigs: &[(String, f64, String)],
 ) -> Vec<Transaction> {
     txs.into_iter()
-        .filter(|tx| !existing_hashes.contains(&tx.tx_hash))
+        .filter(|tx| {
+            if existing_hashes.contains(&tx.tx_hash) {
+                return false;
+            }
+            // Дубль с усечённым описанием: та же дата и сумма, описания — префиксы друг друга
+            let dl = tx.description.to_lowercase();
+            let truncated_dup = existing_sigs.iter().any(|(date, amount, desc)| {
+                date == &tx.date
+                    && (amount - tx.amount).abs() < 0.005
+                    && is_truncation_pair(&dl, desc)
+            });
+            !truncated_dup
+        })
         .collect()
 }

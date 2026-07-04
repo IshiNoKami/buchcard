@@ -263,10 +263,11 @@ pub fn pdf_rows_to_transactions(
 
     let conn = state.0.lock().map_err(|e| e.to_string())?;
     let hashes = db::known_hashes(&conn).map_err(|e| e.to_string())?;
+    let sigs = db::known_signatures(&conn).map_err(|e| e.to_string())?;
     drop(conn);
 
     let total_count = all.len();
-    let new_txs = filter_new(all, &hashes);
+    let new_txs = filter_new(all, &hashes, &sigs);
     let new_count = new_txs.len();
     Ok(ParseResult { new_count, total_count, transactions: new_txs })
 }
@@ -429,6 +430,22 @@ fn ollama_tools() -> serde_json::Value {
                     "required": ["from_date", "to_date"]
                 }
             }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "get_credits_info",
+                "description": "Кредиты и кредитные карты пользователя: остатки долга, ставки, ежемесячные платежи, прогноз переплаты, даты погашения, утилизация карт, льготные периоды. Вызывай при вопросах о кредитах, долгах, досрочном погашении, 'что выгоднее гасить или копить'.",
+                "parameters": { "type": "object", "properties": {}, "required": [] }
+            }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "get_goals_info",
+                "description": "Активные финансовые цели пользователя: лимиты расходов и цели накопления, их бюджеты, текущий прогресс (сколько потрачено/накоплено), сроки. Вызывай при вопросах о целях, накоплениях, планах.",
+                "parameters": { "type": "object", "properties": {}, "required": [] }
+            }
         }
     ])
 }
@@ -493,6 +510,8 @@ fn tool_status(name: &str) -> &'static str {
         "get_monthly_trends"     => "Смотрю динамику по месяцам…",
         "compare_periods"        => "Сравниваю периоды…",
         "propose_goal"           => "Формирую предложение цели…",
+        "get_credits_info"       => "Смотрю кредиты…",
+        "get_goals_info"         => "Проверяю цели…",
         _                        => "Анализирую данные…",
     }
 }
@@ -580,6 +599,43 @@ fn execute_tool(name: &str, args: &serde_json::Value, conn: &rusqlite::Connectio
             // не вызывая больше никаких инструментов.
             "{\"status\": \"proposal_sent\", \"instruction\": \"Карточка с предложением цели показана пользователю. Дай короткий финальный ответ (2-3 предложения) — подтверди что именно предложил и почему. Больше инструменты не вызывай.\"}".to_string()
         }
+        "get_credits_info" => {
+            match db::get_credits(conn) {
+                Ok(credits) => {
+                    let statuses: Vec<CreditStatus> = credits
+                        .into_iter()
+                        .filter(|c| !c.archived)
+                        .map(|c| build_credit_status(conn, c))
+                        .collect();
+                    if statuses.is_empty() {
+                        "{\"info\": \"У пользователя нет активных кредитов и карт\"}".to_string()
+                    } else {
+                        serde_json::to_string(&statuses).unwrap_or_default()
+                    }
+                }
+                Err(e) => format!("{{\"error\": \"{}\"}}", e),
+            }
+        }
+        "get_goals_info" => {
+            match db::get_goals(conn) {
+                Ok(goals) => {
+                    let progress: Vec<serde_json::Value> = goals
+                        .iter()
+                        .map(|g| {
+                            let spent = db::get_goal_spent(conn, g).unwrap_or(0.0);
+                            let pct = if g.budget > 0.0 { round1(spent / g.budget * 100.0) } else { 0.0 };
+                            serde_json::json!({ "goal": g, "spent": spent, "pct": pct })
+                        })
+                        .collect();
+                    if progress.is_empty() {
+                        "{\"info\": \"У пользователя нет активных целей\"}".to_string()
+                    } else {
+                        serde_json::to_string(&progress).unwrap_or_default()
+                    }
+                }
+                Err(e) => format!("{{\"error\": \"{}\"}}", e),
+            }
+        }
         _ => format!("{{\"error\": \"unknown tool: {}\"}}", name),
     }
 }
@@ -665,6 +721,7 @@ pub async fn chat_with_ai(
          3. Первым делом вызови get_data_period чтобы понимать, за какой период вообще есть данные. Если пользователь просит период, где данных нет — честно скажи об этом.\n\
          4. После получения нужных данных сразу давай ответ, без лишних вызовов.\n\
          7. Если анализ показывает категорию с аномально высокими расходами (>30% бюджета или явный пик) — предложи конкретную цель-ограничение через propose_goal. Объясни кратко почему, затем вызови инструмент. Не создавай цели молча — сначала объясни, потом вызывай.\n\
+         8. У тебя есть данные о кредитах (get_credits_info: остатки, ставки, платежи, переплата) и целях (get_goals_info: прогресс лимитов и накоплений). При вопросах о долгах, досрочном погашении, 'гасить или копить' — СНАЧАЛА вызови эти инструменты, потом советуй с реальными цифрами.\n\
          5. Отвечай на русском, суммы в ₽. Называй точные цифры и указывай период анализа (days_in_period).\n\
          6. Не путай расходы и доходы.",
         today
@@ -979,7 +1036,8 @@ pub fn parse_file(path: String, state: State<AppState>) -> Result<ParseResult, S
     let all = parse_xls(Path::new(&path)).map_err(|e| e.to_string())?;
     let total_count = all.len();
     let hashes = db::known_hashes(&conn).map_err(|e| e.to_string())?;
-    let new_txs = filter_new(all, &hashes);
+    let sigs = db::known_signatures(&conn).map_err(|e| e.to_string())?;
+    let new_txs = filter_new(all, &hashes, &sigs);
     let new_count = new_txs.len();
     Ok(ParseResult { new_count, total_count, transactions: new_txs })
 }
@@ -1286,7 +1344,632 @@ pub fn add_kopilka_alias(kopilka_id: i64, alias: String, state: State<AppState>)
 }
 
 #[tauri::command]
-pub fn find_unmatched_kopilka_descriptions(state: State<AppState>) -> Result<Vec<(String, i64)>, String> {
+pub fn find_unmatched_kopilka_descriptions(state: State<AppState>) -> Result<Vec<(String, i64, f64)>, String> {
     let conn = state.0.lock().map_err(|e| e.to_string())?;
     db::find_unmatched_kopilka_descriptions(&conn).map_err(|e| e.to_string())
+}
+
+// ─── Credits ────────────────────────────────────────────────────────────────
+
+#[derive(Debug, Serialize)]
+pub struct CreditStatus {
+    pub credit: db::Credit,
+    pub progress_pct: f64,
+    pub paid_principal: f64,
+    pub paid_interest: f64,
+    // loan
+    pub next_payment_amount: Option<f64>,
+    pub next_payment_date: Option<String>,
+    pub payoff_date: Option<String>,
+    pub months_left: Option<i64>,
+    pub interest_left: Option<f64>,
+    // card
+    pub available: Option<f64>,
+    pub utilization_pct: Option<f64>,
+    pub min_payment: Option<f64>,
+    pub grace_until: Option<String>,
+    pub grace_days_left: Option<i64>,
+}
+
+fn today_str() -> String {
+    chrono::Local::now().format("%Y-%m-%d").to_string()
+}
+
+fn build_credit_status(conn: &rusqlite::Connection, credit: db::Credit) -> CreditStatus {
+    let today = today_str();
+    let payments = db::get_credit_payments(conn, credit.id).unwrap_or_default();
+    let paid_interest: f64 = payments.iter().map(|p| p.interest_part).sum();
+    let paid_principal: f64 = payments
+        .iter()
+        .filter(|p| p.kind == "payment")
+        .map(|p| p.principal_part)
+        .sum();
+
+    if credit.kind == "card" {
+        let limit = credit.principal;
+        let debt = credit.current_balance;
+        let available = (limit - debt).max(0.0);
+        let utilization = if limit > 0.0 { debt / limit * 100.0 } else { 0.0 };
+        let min_payment = credit
+            .min_payment_pct
+            .map(|pct| (debt * pct / 100.0).max(0.0));
+        let (grace_until, grace_days_left) = match (credit.statement_day, credit.grace_days) {
+            (Some(sd), Some(gd)) => crate::credit::grace_status(&today, sd, gd),
+            _ => (None, None),
+        };
+        CreditStatus {
+            credit,
+            progress_pct: utilization,
+            paid_principal,
+            paid_interest,
+            next_payment_amount: None,
+            next_payment_date: None,
+            payoff_date: None,
+            months_left: None,
+            interest_left: None,
+            available: Some(available),
+            utilization_pct: Some(utilization),
+            min_payment,
+            grace_until,
+            grace_days_left,
+        }
+    } else {
+        // loan
+        let balance = credit.current_balance;
+        let scheduled = credit.scheduled_payment.unwrap_or_else(|| {
+            crate::credit::annuity_payment(balance, credit.rate_annual, credit.term_months.unwrap_or(0))
+        });
+        let proj = crate::credit::payoff_projection(
+            balance,
+            credit.rate_annual,
+            scheduled,
+            &today,
+            credit.payment_day,
+        );
+        let interest_this = balance * crate::credit::monthly_rate(credit.rate_annual);
+        let next_amount = scheduled.min(balance + interest_this).max(0.0);
+        let next_date = credit
+            .payment_day
+            .and_then(|d| crate::credit::next_payment_date(&today, d));
+        let progress = if credit.principal > 0.0 {
+            ((credit.principal - balance) / credit.principal * 100.0).clamp(0.0, 100.0)
+        } else {
+            0.0
+        };
+        CreditStatus {
+            credit,
+            progress_pct: progress,
+            paid_principal,
+            paid_interest,
+            next_payment_amount: Some(next_amount),
+            next_payment_date: next_date,
+            payoff_date: proj.payoff_date,
+            months_left: Some(proj.months),
+            interest_left: proj.total_interest.is_finite().then_some(proj.total_interest),
+            available: None,
+            utilization_pct: None,
+            min_payment: None,
+            grace_until: None,
+            grace_days_left: None,
+        }
+    }
+}
+
+#[tauri::command]
+pub fn get_credits(state: State<AppState>) -> Result<Vec<CreditStatus>, String> {
+    let conn = state.0.lock().map_err(|e| e.to_string())?;
+    let credits = db::get_credits(&conn).map_err(|e| e.to_string())?;
+    Ok(credits.into_iter().map(|c| build_credit_status(&conn, c)).collect())
+}
+
+#[tauri::command]
+#[allow(clippy::too_many_arguments)]
+pub fn create_credit(
+    name: String,
+    kind: String,
+    bank: String,
+    principal: f64,
+    current_balance: f64,
+    rate_annual: f64,
+    term_months: Option<i64>,
+    monthly_payment: Option<f64>,
+    payment_day: Option<i64>,
+    start_date: String,
+    grace_days: Option<i64>,
+    statement_day: Option<i64>,
+    min_payment_pct: Option<f64>,
+    state: State<AppState>,
+) -> Result<i64, String> {
+    let conn = state.0.lock().map_err(|e| e.to_string())?;
+    // Плановый платёж: введённый пользователем (в банке он может быть выше из-за
+    // страховок/фактических дней), иначе — расчётный аннуитет от остатка.
+    let scheduled_payment = if kind == "loan" {
+        monthly_payment
+            .filter(|v| *v > 0.0)
+            .or_else(|| term_months.map(|n| crate::credit::annuity_payment(current_balance, rate_annual, n)))
+    } else {
+        None
+    };
+    db::create_credit(
+        &conn, &name, &kind, &bank, principal, current_balance, rate_annual, term_months,
+        scheduled_payment, payment_day, &start_date, grace_days, statement_day, min_payment_pct,
+    )
+    .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+#[allow(clippy::too_many_arguments)]
+pub fn update_credit(
+    id: i64,
+    name: String,
+    bank: String,
+    principal: f64,
+    current_balance: f64,
+    rate_annual: f64,
+    term_months: Option<i64>,
+    monthly_payment: Option<f64>,
+    payment_day: Option<i64>,
+    start_date: String,
+    grace_days: Option<i64>,
+    statement_day: Option<i64>,
+    min_payment_pct: Option<f64>,
+    state: State<AppState>,
+) -> Result<(), String> {
+    let conn = state.0.lock().map_err(|e| e.to_string())?;
+    // Введённый платёж приоритетнее расчётного аннуитета.
+    let existing = db::get_credit(&conn, id).map_err(|e| e.to_string())?;
+    let scheduled_payment = match existing {
+        Some(c) if c.kind == "loan" => {
+            monthly_payment
+                .filter(|v| *v > 0.0)
+                .or_else(|| term_months.map(|n| crate::credit::annuity_payment(current_balance, rate_annual, n)))
+        }
+        _ => None,
+    };
+    db::update_credit(
+        &conn, id, &name, &bank, principal, current_balance, rate_annual, term_months,
+        scheduled_payment, payment_day, &start_date, grace_days, statement_day, min_payment_pct,
+    )
+    .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub fn delete_credit(id: i64, state: State<AppState>) -> Result<(), String> {
+    let conn = state.0.lock().map_err(|e| e.to_string())?;
+    db::delete_credit(&conn, id).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub fn archive_credit(id: i64, archived: bool, state: State<AppState>) -> Result<(), String> {
+    let conn = state.0.lock().map_err(|e| e.to_string())?;
+    db::set_credit_archived(&conn, id, archived).map_err(|e| e.to_string())
+}
+
+/// Записать операцию по кредиту/карте.
+/// kind: 'payment' (внести платёж), 'charge' (трата по карте).
+/// prepay_mode (для кредита при переплате): 'reduce_term' | 'reduce_payment'.
+#[tauri::command]
+pub fn add_credit_payment(
+    credit_id: i64,
+    date: String,
+    amount: f64,
+    kind: String,
+    prepay_mode: Option<String>,
+    note: Option<String>,
+    state: State<AppState>,
+) -> Result<(), String> {
+    let conn = state.0.lock().map_err(|e| e.to_string())?;
+    let credit = db::get_credit(&conn, credit_id)
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| "Кредит не найден".to_string())?;
+    let note = note.unwrap_or_default();
+
+    if credit.kind == "card" {
+        // Карта: charge увеличивает долг, payment уменьшает.
+        let new_balance = if kind == "charge" {
+            credit.current_balance + amount.abs()
+        } else {
+            (credit.current_balance - amount.abs()).max(0.0)
+        };
+        db::add_credit_payment(
+            &conn, credit_id, &date, amount.abs(), 0.0, 0.0, &kind, new_balance, None, &note,
+        )
+        .map_err(|e| e.to_string())?;
+        return Ok(());
+    }
+
+    // Кредит: разбивка на проценты/тело.
+    let (interest, principal) =
+        crate::credit::split_payment(credit.current_balance, credit.rate_annual, amount);
+    if principal <= 0.0 {
+        return Err("Платёж не покрывает проценты — тело не гасится. Увеличьте сумму.".into());
+    }
+    let new_balance = (credit.current_balance - principal).max(0.0);
+
+    // Досрочка «уменьшить платёж»: пересчитать аннуитет на остаток за прежний срок.
+    let new_scheduled = match (prepay_mode.as_deref(), credit.scheduled_payment) {
+        (Some("reduce_payment"), Some(old_sched)) if amount > old_sched + 0.01 && new_balance > 0.0 => {
+            let today = today_str();
+            let n_before = crate::credit::payoff_projection(
+                credit.current_balance, credit.rate_annual, old_sched, &today, credit.payment_day,
+            ).months;
+            if n_before > 0 {
+                Some(crate::credit::annuity_payment(new_balance, credit.rate_annual, n_before))
+            } else {
+                None
+            }
+        }
+        _ => None, // 'reduce_term' и обычный платёж: плановый платёж не меняем
+    };
+
+    db::add_credit_payment(
+        &conn, credit_id, &date, amount, interest, principal, "payment", new_balance, new_scheduled, &note,
+    )
+    .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+#[tauri::command]
+pub fn get_credit_payments(credit_id: i64, state: State<AppState>) -> Result<Vec<db::CreditPayment>, String> {
+    let conn = state.0.lock().map_err(|e| e.to_string())?;
+    db::get_credit_payments(&conn, credit_id).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub fn get_credit_schedule(credit_id: i64, state: State<AppState>) -> Result<Vec<crate::credit::ScheduleRow>, String> {
+    let conn = state.0.lock().map_err(|e| e.to_string())?;
+    let credit = db::get_credit(&conn, credit_id)
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| "Кредит не найден".to_string())?;
+    if credit.kind != "loan" {
+        return Ok(vec![]);
+    }
+    let scheduled = credit.scheduled_payment.unwrap_or_else(|| {
+        crate::credit::annuity_payment(credit.current_balance, credit.rate_annual, credit.term_months.unwrap_or(0))
+    });
+    Ok(crate::credit::schedule(
+        credit.current_balance,
+        credit.rate_annual,
+        scheduled,
+        &today_str(),
+        credit.payment_day,
+    ))
+}
+
+// ─── Net Worth / Analytics ──────────────────────────────────────────────────
+
+#[derive(Debug, Serialize)]
+pub struct NetWorthParts {
+    pub kopilka_total: f64,
+    pub credit_debt: f64,
+}
+
+#[tauri::command]
+pub fn get_net_worth_parts(state: State<AppState>) -> Result<NetWorthParts, String> {
+    let conn = state.0.lock().map_err(|e| e.to_string())?;
+    let kopilka_total = db::get_kopilka_saved_total(&conn).map_err(|e| e.to_string())?;
+    let credit_debt: f64 = db::get_credits(&conn)
+        .map_err(|e| e.to_string())?
+        .iter()
+        .filter(|c| !c.archived)
+        .map(|c| c.current_balance)
+        .sum();
+    Ok(NetWorthParts { kopilka_total, credit_debt })
+}
+
+#[derive(Debug, Serialize)]
+pub struct MonthCompareRow {
+    pub category: String,
+    pub current: f64,
+    pub previous: f64,
+    pub delta: f64,
+    pub pct: Option<f64>, // None если previous == 0
+}
+
+#[derive(Debug, Serialize)]
+pub struct MonthComparison {
+    pub current_label: String,
+    pub previous_label: String,
+    pub total_current: f64,
+    pub total_previous: f64,
+    pub rows: Vec<MonthCompareRow>,
+    pub has_previous: bool,
+}
+
+#[tauri::command]
+pub fn get_month_comparison(state: State<AppState>) -> Result<MonthComparison, String> {
+    use chrono::Datelike;
+    let conn = state.0.lock().map_err(|e| e.to_string())?;
+    let today = chrono::Local::now().date_naive();
+    let cur_from = today.with_day(1).unwrap();
+    let prev_to = cur_from.pred_opt().unwrap();
+    let prev_from = prev_to.with_day(1).unwrap();
+
+    let fmt = |d: chrono::NaiveDate| d.format("%Y-%m-%d").to_string();
+    let cur = db::get_category_totals(&conn, &fmt(cur_from), &fmt(today)).map_err(|e| e.to_string())?;
+    let prev = db::get_category_totals(&conn, &fmt(prev_from), &fmt(prev_to)).map_err(|e| e.to_string())?;
+
+    let months_ru = ["январь","февраль","март","апрель","май","июнь","июль","август","сентябрь","октябрь","ноябрь","декабрь"];
+    let prev_map: std::collections::HashMap<String, f64> =
+        prev.iter().map(|c| (c.category.clone(), c.total)).collect();
+    let cur_map: std::collections::HashMap<String, f64> =
+        cur.iter().map(|c| (c.category.clone(), c.total)).collect();
+
+    // Объединить категории обоих месяцев
+    let mut names: Vec<String> = cur_map.keys().chain(prev_map.keys()).cloned().collect();
+    names.sort();
+    names.dedup();
+
+    // Не сравнивать доход и снятые с учёта категории (переводы, копилка)
+    let excluded: std::collections::HashSet<String> = db::get_categories(&conn)
+        .map_err(|e| e.to_string())?
+        .into_iter()
+        .filter(|c| c.excluded)
+        .map(|c| c.name)
+        .collect();
+
+    let mut rows: Vec<MonthCompareRow> = names.into_iter()
+        .filter(|n| n != "Доход" && !excluded.contains(n))
+        .map(|name| {
+            let c = *cur_map.get(&name).unwrap_or(&0.0);
+            let p = *prev_map.get(&name).unwrap_or(&0.0);
+            let pct = if p.abs() > 0.001 { Some(((c - p) / p * 100.0 * 10.0).round() / 10.0) } else { None };
+            MonthCompareRow { category: name, current: c, previous: p, delta: c - p, pct }
+        })
+        .collect();
+    rows.sort_by(|a, b| b.delta.abs().partial_cmp(&a.delta.abs()).unwrap_or(std::cmp::Ordering::Equal));
+
+    let total_current: f64 = rows.iter().map(|r| r.current).sum();
+    let total_previous: f64 = rows.iter().map(|r| r.previous).sum();
+
+    Ok(MonthComparison {
+        current_label: months_ru[cur_from.month0() as usize].to_string(),
+        previous_label: months_ru[prev_from.month0() as usize].to_string(),
+        total_current,
+        total_previous,
+        has_previous: total_previous > 0.001,
+        rows,
+    })
+}
+
+// ─── Planned items ──────────────────────────────────────────────────────────
+
+#[tauri::command]
+pub fn get_planned_items(state: State<AppState>) -> Result<Vec<db::PlannedItem>, String> {
+    let conn = state.0.lock().map_err(|e| e.to_string())?;
+    db::get_planned_items(&conn).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub fn create_planned_item(name: String, amount: f64, date: String, kind: String, state: State<AppState>) -> Result<i64, String> {
+    let conn = state.0.lock().map_err(|e| e.to_string())?;
+    db::create_planned_item(&conn, &name, amount, &date, &kind).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub fn update_planned_item(id: i64, name: String, amount: f64, date: String, kind: String, state: State<AppState>) -> Result<(), String> {
+    let conn = state.0.lock().map_err(|e| e.to_string())?;
+    db::update_planned_item(&conn, id, &name, amount, &date, &kind).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub fn delete_planned_item(id: i64, state: State<AppState>) -> Result<(), String> {
+    let conn = state.0.lock().map_err(|e| e.to_string())?;
+    db::delete_planned_item(&conn, id).map_err(|e| e.to_string())
+}
+
+// ─── Cash-flow forecast ─────────────────────────────────────────────────────
+
+#[derive(Debug, Serialize)]
+pub struct ForecastPoint {
+    pub date: String,
+    pub balance: f64,
+    pub event: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct CashForecast {
+    pub points: Vec<ForecastPoint>,
+    pub min_balance: f64,
+    pub min_date: String,
+    pub has_gap: bool,
+    pub daily_avg: f64,
+}
+
+/// Прогноз баланса на N дней вперёд. Баланс передаёт фронт (якорная логика там):
+/// доходы — аванс/зарплата из настроек, расходы — платежи по кредитам + средний быт.
+#[tauri::command]
+pub fn get_cash_forecast(
+    current_balance: f64,
+    days: Option<i64>,
+    state: State<AppState>,
+) -> Result<CashForecast, String> {
+    use chrono::{Datelike, Duration};
+    let conn = state.0.lock().map_err(|e| e.to_string())?;
+    let days = days.unwrap_or(30).clamp(7, 365);
+    let today = chrono::Local::now().date_naive();
+
+    let settings = db::get_settings(&conn).map_err(|e| e.to_string())?;
+
+    // Плановые платежи по активным кредитам (сумма + день месяца)
+    let loan_payments: Vec<(String, i64, f64)> = db::get_credits(&conn)
+        .map_err(|e| e.to_string())?
+        .into_iter()
+        .filter(|c| !c.archived && c.kind == "loan" && c.current_balance > 0.005)
+        .filter_map(|c| {
+            let day = c.payment_day?;
+            let status = build_credit_status(&conn, c.clone());
+            let amount = status.next_payment_amount?;
+            (amount > 0.0).then(|| (c.name, day, amount))
+        })
+        .collect();
+
+    // Средний дневной расход за последние 7 дней (скользящее окно — пользователь
+    // корректирует траты, месячное среднее слишком инертно).
+    // Жёстко исключаем из быта, НЕЗАВИСИМО от тумблера категорий:
+    //  - «Переводы» и «Копилка/Сбережения» — там взаимозачёты и внутренние движения;
+    //  - транзакции накопительных счетов (kopilka-импорты);
+    //  - транзакции, уже записанные как платежи по кредитам (платежи в прогнозе
+    //    учитываются отдельными событиями из модуля кредитов — по введённым там
+    //    суммам и датам, а не из выписки).
+    const AVG_WINDOW_DAYS: i64 = 7;
+    let from_avg = (today - Duration::days(AVG_WINDOW_DAYS)).format("%Y-%m-%d").to_string();
+    let today_s = today.format("%Y-%m-%d").to_string();
+    let spent_week: f64 = conn.query_row(
+        "SELECT COALESCE(SUM(t.amount), 0)
+         FROM transactions t
+         LEFT JOIN imports i ON t.import_id = i.id
+         LEFT JOIN categories c ON t.category = c.name
+         WHERE t.is_income = 0
+           AND t.date >= ?1 AND t.date <= ?2
+           AND i.kopilka_id IS NULL
+           AND COALESCE(c.excluded, 0) = 0
+           AND t.category NOT IN ('Переводы', 'Копилка/Сбережения')
+           AND NOT EXISTS (
+               SELECT 1 FROM credit_payments cp
+               WHERE cp.date = t.date AND ABS(cp.amount - t.amount) < 0.01
+           )",
+        rusqlite::params![from_avg, today_s],
+        |r| r.get(0),
+    ).unwrap_or(0.0);
+    let daily_avg = spent_week / AVG_WINDOW_DAYS as f64;
+
+    // Запланированные разовые события (отпуск, покупки, ожидаемые доходы).
+    // Прошедшие даты игнорируем — они уже отражены в выписке.
+    let planned: Vec<db::PlannedItem> = db::get_planned_items(&conn)
+        .map_err(|e| e.to_string())?
+        .into_iter()
+        .filter(|p| p.date.as_str() > today_s.as_str())
+        .collect();
+
+    let mut balance = current_balance;
+    let mut points: Vec<ForecastPoint> = Vec::with_capacity(days as usize);
+    let mut min_balance = balance;
+    let mut min_date = today_s.clone();
+
+    for i in 1..=days {
+        let d = today + Duration::days(i);
+        let dom = d.day() as i64;
+        let last_dom = {
+            // клип дня платежа к последнему дню месяца (31-е в июне → 30-е)
+            let (ny, nm) = if d.month() == 12 { (d.year() + 1, 1) } else { (d.year(), d.month() + 1) };
+            chrono::NaiveDate::from_ymd_opt(ny, nm, 1).unwrap().pred_opt().unwrap().day() as i64
+        };
+        let hits = |day: i64| -> bool { dom == day.min(last_dom) };
+
+        let mut events: Vec<String> = Vec::new();
+
+        if let (Some(day), Some(amount)) = (settings.advance_day, settings.advance_amount) {
+            if amount > 0.0 && hits(day as i64) {
+                balance += amount;
+                events.push("Аванс".to_string());
+            }
+        }
+        if let (Some(day), Some(amount)) = (settings.salary_day, settings.salary_amount) {
+            if amount > 0.0 && hits(day as i64) {
+                balance += amount;
+                events.push("Зарплата".to_string());
+            }
+        }
+        for (name, day, amount) in &loan_payments {
+            if hits(*day) {
+                balance -= amount;
+                events.push(format!("Платёж: {}", name));
+            }
+        }
+
+        let date_key = d.format("%Y-%m-%d").to_string();
+        for p in planned.iter().filter(|p| p.date == date_key) {
+            if p.kind == "income" {
+                balance += p.amount;
+                events.push(p.name.clone());
+            } else {
+                balance -= p.amount;
+                events.push(format!("План: {}", p.name));
+            }
+        }
+
+        balance -= daily_avg;
+
+        let date_s = d.format("%Y-%m-%d").to_string();
+        if balance < min_balance {
+            min_balance = balance;
+            min_date = date_s.clone();
+        }
+        points.push(ForecastPoint {
+            date: date_s,
+            balance: (balance * 100.0).round() / 100.0,
+            event: (!events.is_empty()).then(|| events.join(" · ")),
+        });
+    }
+
+    Ok(CashForecast {
+        points,
+        min_balance: (min_balance * 100.0).round() / 100.0,
+        min_date,
+        has_gap: min_balance < 0.0,
+        daily_avg: (daily_avg * 100.0).round() / 100.0,
+    })
+}
+
+// ─── Reminders ──────────────────────────────────────────────────────────────
+
+#[derive(Debug, Serialize)]
+pub struct Reminder {
+    pub kind: String,   // 'loan_payment' | 'grace_expiry'
+    pub title: String,
+    pub body: String,
+    pub key: String,    // стабильный ключ для анти-спама на фронте
+}
+
+#[tauri::command]
+pub fn find_credit_payment_candidates(state: State<AppState>) -> Result<Vec<db::CreditPaymentCandidate>, String> {
+    let conn = state.0.lock().map_err(|e| e.to_string())?;
+    db::find_credit_payment_candidates(&conn).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub fn get_due_reminders(state: State<AppState>) -> Result<Vec<Reminder>, String> {
+    let conn = state.0.lock().map_err(|e| e.to_string())?;
+    let today = today_str();
+    let mut reminders = Vec::new();
+
+    for credit in db::get_credits(&conn).map_err(|e| e.to_string())? {
+        if credit.archived { continue; }
+
+        if credit.kind == "loan" {
+            let Some(day) = credit.payment_day else { continue };
+            let Some(next) = crate::credit::next_payment_date(&today, day) else { continue };
+            let days_until = (chrono::NaiveDate::parse_from_str(&next, "%Y-%m-%d").unwrap()
+                - chrono::NaiveDate::parse_from_str(&today, "%Y-%m-%d").unwrap()).num_days();
+            if days_until <= 1 {
+                let status = build_credit_status(&conn, credit.clone());
+                let amount = status.next_payment_amount.unwrap_or(0.0);
+                let when = if days_until == 0 { "Сегодня" } else { "Завтра" };
+                reminders.push(Reminder {
+                    kind: "loan_payment".into(),
+                    title: format!("{} платёж по кредиту", when),
+                    body: format!("{} — {:.0} ₽", credit.name, amount),
+                    key: format!("loan-{}-{}", credit.id, next),
+                });
+            }
+        } else if let (Some(sd), Some(gd)) = (credit.statement_day, credit.grace_days) {
+            if credit.current_balance <= 0.005 { continue; }
+            let (until, days_left) = crate::credit::grace_status(&today, sd, gd);
+            if let (Some(until), Some(days_left)) = (until, days_left) {
+                if (0..=3).contains(&days_left) {
+                    reminders.push(Reminder {
+                        kind: "grace_expiry".into(),
+                        title: "Льготный период истекает".into(),
+                        body: format!(
+                            "{}: осталось {} дн., долг {:.0} ₽",
+                            credit.name, days_left, credit.current_balance
+                        ),
+                        key: format!("grace-{}-{}", credit.id, until),
+                    });
+                }
+            }
+        }
+    }
+    Ok(reminders)
 }

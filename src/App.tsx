@@ -1,18 +1,23 @@
 import { useState, useEffect, useCallback, useMemo } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import { Transaction, Category, Import } from "./lib/types";
+import { Transaction, Category, Import, NetWorthParts, Reminder } from "./lib/types";
+import { isPermissionGranted, requestPermission, sendNotification } from "@tauri-apps/plugin-notification";
 import { KpiCards } from "./components/dashboard/KpiCards";
 import { SpendingPie, TopMerchantsBar, DailyArea } from "./components/dashboard/Charts";
 import { TransactionTable } from "./components/dashboard/TransactionTable";
 import { ImportWizard } from "./components/wizard/ImportWizard";
 import { Button } from "./components/ui/button";
-import { Upload, RefreshCw, CreditCard, Calendar, Settings, MessageSquare, Trash2, ChevronDown, Wallet, SlidersHorizontal } from "lucide-react";
+import { Upload, RefreshCw, CreditCard, Calendar, Settings, MessageSquare, Trash2, ChevronDown, Wallet, SlidersHorizontal, LayoutDashboard, Target, Landmark, Scale, BellRing } from "lucide-react";
 import { formatCurrency } from "./lib/utils";
 import { DateRangePicker, DateRange } from "./components/ui/date-range-picker";
 import { useTheme, THEMES } from "./lib/theme";
 import { SettingsPanel } from "./components/SettingsPanel";
 import { ChatPanel } from "./components/ChatPanel";
 import { GoalsWidget } from "./components/dashboard/GoalsWidget";
+import { CreditsWidget } from "./components/dashboard/CreditsWidget";
+import { MonthCompare } from "./components/dashboard/MonthCompare";
+import { CashForecast } from "./components/dashboard/CashForecast";
+import { PlanningBlock } from "./components/dashboard/PlanningBlock";
 
 const MONTHS_RU = ["янв", "фев", "мар", "апр", "май", "июн", "июл", "авг", "сен", "окт", "ноя", "дек"];
 
@@ -28,6 +33,28 @@ function formatPeriod(from: string, to: string): string {
   return `${fm} ${fy} – ${tm} ${ty}`;
 }
 
+// Системные уведомления с анти-спамом: каждый reminder-key не чаще раза в день.
+async function notifyReminders(rems: Reminder[]) {
+  if (rems.length === 0) return;
+  const todayKey = new Date().toISOString().slice(0, 10);
+  let notified: Record<string, string> = {};
+  try { notified = JSON.parse(localStorage.getItem("buchcard_notified") ?? "{}"); } catch { /* ignore */ }
+  const fresh = rems.filter(r => notified[r.key] !== todayKey);
+  if (fresh.length === 0) return;
+  try {
+    let granted = await isPermissionGranted();
+    if (!granted) granted = (await requestPermission()) === "granted";
+    if (!granted) return;
+    for (const r of fresh) {
+      sendNotification({ title: r.title, body: r.body });
+      notified[r.key] = todayKey;
+    }
+    localStorage.setItem("buchcard_notified", JSON.stringify(notified));
+  } catch (e) {
+    console.error("notification error", e);
+  }
+}
+
 export default function App() {
   const { theme, setTheme } = useTheme();
   const nextTheme = () => {
@@ -39,11 +66,14 @@ export default function App() {
   const [transactions, setTransactions] = useState<Transaction[]>([]);
   const [categories, setCategories] = useState<Category[]>([]);
   const [imports, setImports] = useState<Import[]>([]);
+  const [netWorth, setNetWorth] = useState<NetWorthParts | null>(null);
+  const [reminders, setReminders] = useState<Reminder[]>([]);
   const [selectedImport, setSelectedImport] = useState<Import | null>(null);
   const [customRange, setCustomRange] = useState<DateRange | null>(null);
   const [period, setPeriod] = useState<"7d" | "30d" | "90d" | "all">("30d");
   const [showImports, setShowImports] = useState(false);
   const [showCatFilter, setShowCatFilter] = useState(false);
+  const [tab, setTab] = useState<"overview" | "goals" | "credits">("overview");
   const [showWizard, setShowWizard] = useState(false);
   const [showSettings, setShowSettings] = useState(false);
   const [showChat, setShowChat] = useState(false);
@@ -56,14 +86,19 @@ export default function App() {
   const load = useCallback(async () => {
     setLoading(true);
     try {
-      const [txs, cats, imps] = await Promise.all([
+      const [txs, cats, imps, nw, rems] = await Promise.all([
         invoke<Transaction[]>("get_transactions"),
         invoke<Category[]>("get_categories"),
         invoke<Import[]>("get_imports"),
+        invoke<NetWorthParts>("get_net_worth_parts").catch(() => null),
+        invoke<Reminder[]>("get_due_reminders").catch(() => [] as Reminder[]),
       ]);
       setTransactions(txs);
       setCategories(cats);
       setImports(imps);
+      setNetWorth(nw);
+      setReminders(rems);
+      notifyReminders(rems);
       // Notify self-contained widgets (goals) to recompute after any data change.
       window.dispatchEvent(new CustomEvent("buchcard:data-changed"));
     } finally {
@@ -73,8 +108,9 @@ export default function App() {
 
   useEffect(() => { load(); }, [load]);
 
+  // Только перезагрузка данных — визард закрывает сам себя с экрана «Готово» (onClose),
+  // иначе пост-коммитные шаги (копилки, кредиты) никогда не показываются.
   const onImportComplete = () => {
-    setShowWizard(false);
     load();
   };
 
@@ -235,6 +271,32 @@ export default function App() {
             </Button>
           </div>
 
+          {/* Tabs */}
+          <div className="flex items-center gap-1 border-b border-border">
+            {([
+              ["overview", "Обзор", LayoutDashboard],
+              ["goals", "Цели", Target],
+              ["credits", "Кредиты", Landmark],
+            ] as const).map(([id, label, Icon]) => (
+              <button
+                key={id}
+                onClick={() => setTab(id)}
+                className={`flex items-center gap-1.5 px-4 py-2 text-sm border-b-2 -mb-px transition-colors ${
+                  tab === id
+                    ? "border-primary text-foreground font-medium"
+                    : "border-transparent text-muted-foreground hover:text-foreground"
+                }`}
+              >
+                <Icon className="h-4 w-4" />
+                {label}
+              </button>
+            ))}
+          </div>
+
+          {/* ─── Обзор ─── */}
+          {tab === "overview" && (
+          <div className="space-y-5">
+
           {/* Period filter */}
           <div className="space-y-2">
             <div className="flex items-center gap-2 flex-wrap">
@@ -388,17 +450,55 @@ export default function App() {
             </div>
           ) : (
             <>
-              {calculatedBalance != null && (
-                <div className="flex items-center gap-3 rounded-xl border border-border bg-card px-4 py-3 w-fit">
-                  <Wallet className="h-4 w-4 text-sky-400 shrink-0" />
-                  <div>
-                    <p className="text-[11px] text-muted-foreground leading-none mb-0.5">Баланс счёта</p>
-                    <p className={`text-lg font-bold leading-none ${calculatedBalance >= 0 ? "text-sky-400" : "text-red-400"}`}>
-                      {formatCurrency(calculatedBalance)}
-                    </p>
-                  </div>
+              {reminders.length > 0 && (
+                <div className="space-y-2">
+                  {reminders.map(r => (
+                    <div key={r.key} className="flex items-center gap-2 rounded-lg border border-amber-500/30 bg-amber-500/10 px-3 py-2">
+                      <BellRing className="h-4 w-4 text-amber-400 shrink-0" />
+                      <p className="text-xs text-amber-400">
+                        <span className="font-medium">{r.title}:</span> {r.body}
+                      </p>
+                    </div>
+                  ))}
                 </div>
               )}
+
+              <div className="flex items-stretch gap-3 flex-wrap">
+                {calculatedBalance != null && (
+                  <div className="flex items-center gap-3 rounded-xl border border-border bg-card px-4 py-3 w-fit">
+                    <Wallet className="h-4 w-4 text-sky-400 shrink-0" />
+                    <div>
+                      <p className="text-[11px] text-muted-foreground leading-none mb-0.5">Баланс счёта</p>
+                      <p className={`text-lg font-bold leading-none ${calculatedBalance >= 0 ? "text-sky-400" : "text-red-400"}`}>
+                        {formatCurrency(calculatedBalance)}
+                      </p>
+                    </div>
+                  </div>
+                )}
+                {netWorth && (netWorth.kopilka_total > 0 || netWorth.credit_debt > 0) && (() => {
+                  const total = (calculatedBalance ?? 0) + netWorth.kopilka_total - netWorth.credit_debt;
+                  return (
+                    <div className="flex items-center gap-3 rounded-xl border border-border bg-card px-4 py-3 w-fit">
+                      <Scale className="h-4 w-4 text-violet-400 shrink-0" />
+                      <div>
+                        <p className="text-[11px] text-muted-foreground leading-none mb-0.5">Чистая стоимость</p>
+                        <p className={`text-lg font-bold leading-none ${total >= 0 ? "text-violet-400" : "text-red-400"}`}>
+                          {formatCurrency(total)}
+                        </p>
+                        <p className="text-[10px] text-muted-foreground mt-1 leading-none">
+                          {netWorth.kopilka_total > 0 && <span className="text-emerald-400/80">+копилки {formatCurrency(netWorth.kopilka_total)}</span>}
+                          {netWorth.kopilka_total > 0 && netWorth.credit_debt > 0 && " · "}
+                          {netWorth.credit_debt > 0 && <span className="text-red-400/80">−долги {formatCurrency(netWorth.credit_debt)}</span>}
+                        </p>
+                      </div>
+                    </div>
+                  );
+                })()}
+              </div>
+              {calculatedBalance != null && <CashForecast currentBalance={calculatedBalance} />}
+
+              <PlanningBlock />
+
               <KpiCards transactions={analyzed} />
 
               <div className="grid grid-cols-1 lg:grid-cols-5 gap-5">
@@ -412,7 +512,7 @@ export default function App() {
 
               <DailyArea transactions={analyzed} />
 
-              <GoalsWidget categories={categories} />
+              <MonthCompare />
 
               <TransactionTable
                 transactions={analyzed}
@@ -424,6 +524,14 @@ export default function App() {
               />
             </>
           )}
+          </div>
+          )}
+
+          {/* ─── Цели ─── */}
+          {tab === "goals" && <GoalsWidget categories={categories} />}
+
+          {/* ─── Кредиты ─── */}
+          {tab === "credits" && <CreditsWidget />}
         </div>
       </div>
 

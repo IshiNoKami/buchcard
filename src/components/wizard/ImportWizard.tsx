@@ -4,19 +4,19 @@ import { listen } from "@tauri-apps/api/event";
 import { open as openDialog } from "@tauri-apps/plugin-dialog";
 import {
   Transaction, CategorizedTx, ParseResult, ProgressEvent,
-  Category, PdfRow, ParsedPdf, Kopilka,
+  Category, PdfRow, ParsedPdf, Kopilka, CreditPaymentCandidate,
 } from "@/lib/types";
 import { Button } from "@/components/ui/button";
 import { Progress } from "@/components/ui/progress";
 import { Badge } from "@/components/ui/badge";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
-import { formatCurrency, cn } from "@/lib/utils";
+import { formatCurrency, formatDate, cn } from "@/lib/utils";
 import {
   FileUp, Bot, CheckCircle2, ChevronRight, X,
-  Loader2, AlertCircle, AlertTriangle, ArrowRight, PiggyBank, Link2,
+  Loader2, AlertCircle, AlertTriangle, ArrowRight, PiggyBank, Link2, Landmark,
 } from "lucide-react";
 
-type Step = "pick" | "parsing" | "pdf-review" | "ai" | "review" | "kopilka-link" | "done";
+type Step = "pick" | "parsing" | "pdf-review" | "ai" | "review" | "kopilka-link" | "credit-link" | "done";
 
 type DescriptionAction =
   | { type: "link"; kopilkaId: number }
@@ -53,11 +53,16 @@ export function ImportWizard({ categories, onComplete, onClose }: Props) {
   const [committing, setCommitting] = useState(false);
   const logRef = useRef<HTMLDivElement>(null);
 
-  // Kopilka link state (post-commit step)
-  const [unmatchedDescs, setUnmatchedDescs] = useState<[string, number][]>([]);
+  // Kopilka link state (post-commit step): [description, count, total ₽]
+  const [unmatchedDescs, setUnmatchedDescs] = useState<[string, number, number][]>([]);
   const [kopilkas, setKopilkas] = useState<Kopilka[]>([]);
   const [descActions, setDescActions] = useState<Record<string, DescriptionAction>>({});
   const [savingLinks, setSavingLinks] = useState(false);
+
+  // Credit payment detection state (post-commit step)
+  const [creditCandidates, setCreditCandidates] = useState<CreditPaymentCandidate[]>([]);
+  const [selectedTxs, setSelectedTxs] = useState<Set<number>>(new Set());
+  const [savingCreditLinks, setSavingCreditLinks] = useState(false);
 
   // Account type selector
   const [accountType, setAccountType] = useState<"main" | "savings">("main");
@@ -234,7 +239,7 @@ export function ImportWizard({ categories, onComplete, onClose }: Props) {
 
       // Check for kopilka transactions that don't match any known alias
       const [unmatched, kops] = await Promise.all([
-        invoke<[string, number][]>("find_unmatched_kopilka_descriptions"),
+        invoke<[string, number, number][]>("find_unmatched_kopilka_descriptions"),
         invoke<Kopilka[]>("get_kopilkas"),
       ]);
       if (unmatched.length > 0) {
@@ -245,12 +250,52 @@ export function ImportWizard({ categories, onComplete, onClose }: Props) {
         setDescActions(actions);
         setStep("kopilka-link");
       } else {
-        setStep("done");
+        await proceedToCreditsOrDone();
       }
     } catch (e) {
       console.error(e);
     } finally {
       setCommitting(false);
+    }
+  };
+
+  // После копилок — проверить, есть ли в импорте платежи по кредитам
+  const proceedToCreditsOrDone = async () => {
+    try {
+      const candidates = await invoke<CreditPaymentCandidate[]>("find_credit_payment_candidates");
+      if (candidates.length > 0) {
+        setCreditCandidates(candidates);
+        setSelectedTxs(new Set(candidates.map((c) => c.tx_id)));
+        setStep("credit-link");
+        return;
+      }
+    } catch (e) {
+      console.error(e);
+    }
+    setStep("done");
+  };
+
+  const confirmCreditPayments = async () => {
+    setSavingCreditLinks(true);
+    try {
+      for (const c of creditCandidates) {
+        if (!selectedTxs.has(c.tx_id)) continue;
+        await invoke("add_credit_payment", {
+          creditId: c.credit_id,
+          date: c.date,
+          amount: c.amount,
+          kind: "payment",
+          prepayMode: null,
+          note: "Из выписки",
+        });
+      }
+      onComplete(); // обновить дашборд (остатки кредитов изменились)
+      setStep("done");
+    } catch (e) {
+      console.error(e);
+      alert("Ошибка записи платежа: " + String(e));
+    } finally {
+      setSavingCreditLinks(false);
     }
   };
 
@@ -264,7 +309,7 @@ export function ImportWizard({ categories, onComplete, onClose }: Props) {
           await invoke("create_kopilka", { name: action.newName.trim(), initialAlias: desc });
         }
       }
-      setStep("done");
+      await proceedToCreditsOrDone();
     } catch (e) {
       console.error(e);
     } finally {
@@ -290,8 +335,8 @@ export function ImportWizard({ categories, onComplete, onClose }: Props) {
       ];
 
   const stepIdx = isPdf
-    ? ({ pick: 0, parsing: 0, "pdf-review": 1, ai: 2, review: 3, "kopilka-link": 4, done: 4 } as Record<string, number>)[step] ?? 0
-    : ({ pick: 0, parsing: 0, ai: 1, review: 2, "kopilka-link": 3, done: 3 } as Record<string, number>)[step] ?? 0;
+    ? ({ pick: 0, parsing: 0, "pdf-review": 1, ai: 2, review: 3, "kopilka-link": 4, "credit-link": 4, done: 4 } as Record<string, number>)[step] ?? 0
+    : ({ pick: 0, parsing: 0, ai: 1, review: 2, "kopilka-link": 3, "credit-link": 3, done: 3 } as Record<string, number>)[step] ?? 0;
 
   // ── Helpers for editable rows ────────────────────────────────────────────────
 
@@ -864,7 +909,7 @@ export function ImportWizard({ categories, onComplete, onClose }: Props) {
               </div>
 
               <div className="space-y-2">
-                {unmatchedDescs.map(([desc, count]) => {
+                {unmatchedDescs.map(([desc, count, total]) => {
                   const action = descActions[desc] ?? { type: "skip" };
                   const shortDesc = desc.length > 70 ? desc.slice(0, 70) + "…" : desc;
                   return (
@@ -880,7 +925,10 @@ export function ImportWizard({ categories, onComplete, onClose }: Props) {
                       <div className="flex items-start gap-2">
                         <Link2 className={cn("h-3.5 w-3.5 shrink-0 mt-0.5", action.type !== "skip" ? "text-sky-400" : "text-muted-foreground/40")} />
                         <span className="text-xs text-foreground flex-1 break-words">{shortDesc}</span>
-                        <span className="text-[11px] text-muted-foreground shrink-0 ml-1">{count}×</span>
+                        <span className="shrink-0 ml-1 text-right">
+                          <span className="block text-xs font-medium text-emerald-400">{formatCurrency(total)}</span>
+                          <span className="block text-[10px] text-muted-foreground">{count} операц.</span>
+                        </span>
                       </div>
 
                       <div className="flex gap-2 flex-wrap pl-5">
@@ -942,6 +990,59 @@ export function ImportWizard({ categories, onComplete, onClose }: Props) {
                         </div>
                       )}
                     </div>
+                  );
+                })}
+              </div>
+            </div>
+          )}
+
+          {/* ── Credit payment link ── */}
+          {step === "credit-link" && (
+            <div className="space-y-4">
+              <div className="flex items-start gap-3">
+                <Landmark className="h-5 w-5 text-sky-400 shrink-0 mt-0.5" />
+                <div>
+                  <p className="text-sm font-medium">Найдены платежи по кредитам</p>
+                  <p className="text-xs text-muted-foreground mt-0.5">
+                    Эти списания похожи на платежи по вашим кредитам. Отметьте те, которые нужно записать — остаток долга уменьшится автоматически.
+                  </p>
+                </div>
+              </div>
+
+              <div className="space-y-2">
+                {creditCandidates.map((c) => {
+                  const checked = selectedTxs.has(c.tx_id);
+                  return (
+                    <label
+                      key={c.tx_id}
+                      className={cn(
+                        "flex items-start gap-3 rounded-lg border p-3 cursor-pointer transition-colors",
+                        checked ? "border-sky-500/40 bg-sky-500/5" : "border-border/40 bg-secondary/10"
+                      )}
+                    >
+                      <input
+                        type="checkbox"
+                        checked={checked}
+                        onChange={(e) => {
+                          setSelectedTxs((prev) => {
+                            const next = new Set(prev);
+                            if (e.target.checked) next.add(c.tx_id); else next.delete(c.tx_id);
+                            return next;
+                          });
+                        }}
+                        className="h-3.5 w-3.5 mt-0.5 shrink-0"
+                      />
+                      <div className="min-w-0 flex-1">
+                        <div className="flex items-center gap-2">
+                          <span className="text-sm font-medium">{formatCurrency(c.amount)}</span>
+                          <span className="text-xs text-muted-foreground">{formatDate(c.date)}</span>
+                          <span className="text-xs text-sky-400 ml-auto shrink-0">→ {c.credit_name}</span>
+                        </div>
+                        <p className="text-[11px] text-muted-foreground truncate mt-0.5">
+                          {c.description.length > 80 ? c.description.slice(0, 80) + "…" : c.description}
+                        </p>
+                      </div>
+                    </label>
                   );
                 })}
               </div>
@@ -1013,7 +1114,7 @@ export function ImportWizard({ categories, onComplete, onClose }: Props) {
         {step === "kopilka-link" && (
           <div className="px-6 py-4 border-t border-border bg-secondary/20 flex items-center justify-between shrink-0">
             <button
-              onClick={() => setStep("done")}
+              onClick={() => proceedToCreditsOrDone()}
               className="text-xs text-muted-foreground hover:text-foreground transition-colors"
             >
               Пропустить всё
@@ -1028,6 +1129,30 @@ export function ImportWizard({ categories, onComplete, onClose }: Props) {
                 <>
                   <PiggyBank className="h-4 w-4 mr-1.5" />
                   Сохранить связи
+                </>
+              )}
+            </Button>
+          </div>
+        )}
+
+        {step === "credit-link" && (
+          <div className="px-6 py-4 border-t border-border bg-secondary/20 flex items-center justify-between shrink-0">
+            <button
+              onClick={() => setStep("done")}
+              className="text-xs text-muted-foreground hover:text-foreground transition-colors"
+            >
+              Пропустить
+            </button>
+            <Button onClick={confirmCreditPayments} disabled={savingCreditLinks || selectedTxs.size === 0}>
+              {savingCreditLinks ? (
+                <>
+                  <Loader2 className="h-4 w-4 animate-spin mr-2" />
+                  Записываем...
+                </>
+              ) : (
+                <>
+                  <Landmark className="h-4 w-4 mr-1.5" />
+                  Записать платежи ({selectedTxs.size})
                 </>
               )}
             </Button>
