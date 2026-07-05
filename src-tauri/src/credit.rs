@@ -215,7 +215,8 @@ pub fn simulate_repayment_schedule(loans: &[SimLoan], extra_by_month: &[f64]) ->
     SimResult { months, total_interest: interest_total, debt_by_month, monthly_detail }
 }
 
-/// Упрощённый вариант с постоянной ежемесячной досрочкой.
+/// Упрощённый вариант с постоянной ежемесячной досрочкой (используется в тестах).
+#[allow(dead_code)]
 pub fn simulate_repayment(loans: &[SimLoan], extra_monthly: f64) -> (i64, f64) {
     let r = simulate_repayment_schedule(loans, &[extra_monthly]);
     (r.months, r.total_interest)

@@ -74,9 +74,13 @@ pub fn parse_xls(filepath: &Path) -> Result<Vec<Transaction>> {
             import_id: None,
             date,
             amount,
-            description,
             merchant_key,
-            category: if is_income { "Доход".to_string() } else { String::new() },
+            category: if is_income {
+                crate::categorizer::income_category(&description).to_string()
+            } else {
+                String::new()
+            },
+            description,
             tx_hash: hash,
             is_income,
         });

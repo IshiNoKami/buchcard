@@ -3,6 +3,7 @@ mod categorizer;
 mod commands;
 mod credit;
 mod db;
+mod gazprombank_pdf;
 mod importer;
 mod normalizer;
 mod pdf_parser;
@@ -20,6 +21,7 @@ pub fn run() {
     db::init_planned(&conn).expect("Failed to init planned_items table");
     db::renormalize_merchant_keys(&conn).ok();
     db::dedupe_truncated_descriptions(&conn).ok();
+    db::recat_income_transfers(&conn).ok();
 
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())

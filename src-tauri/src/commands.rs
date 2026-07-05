@@ -230,6 +230,18 @@ pub fn delete_import(import_id: i64, state: State<AppState>) -> Result<usize, St
 
 #[tauri::command]
 pub fn parse_pdf_preview(path: String) -> Result<ParsedPdf, String> {
+    // Автодетект банка по текстовому слою: Газпромбанк или Совкомбанк (по умолчанию)
+    if let Ok(text) = pdf_extract::extract_text(&path) {
+        if crate::gazprombank_pdf::is_gazprombank(&text) {
+            let filename = Path::new(&path)
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .to_string();
+            return crate::gazprombank_pdf::parse_gazprombank_text(&text, &filename)
+                .map_err(|e| e.to_string());
+        }
+    }
     crate::pdf_parser::parse_sovkombank_pdf(&path).map_err(|e| e.to_string())
 }
 
@@ -247,6 +259,11 @@ pub fn pdf_rows_to_transactions(
                 crate::normalizer::normalize_merchant(&r.description)
             };
             let tx_hash = tx_hash(&r.date, r.amount, &r.description);
+            let category = if r.is_income {
+                crate::categorizer::income_category(&r.description).to_string()
+            } else {
+                String::new()
+            };
             Transaction {
                 id: None,
                 import_id: None,
@@ -254,7 +271,7 @@ pub fn pdf_rows_to_transactions(
                 amount: r.amount,
                 description: r.description,
                 merchant_key,
-                category: if r.is_income { "Доход".to_string() } else { String::new() },
+                category,
                 tx_hash,
                 is_income: r.is_income,
             }
@@ -730,6 +747,7 @@ pub async fn chat_with_ai(
          - Все суммы в рублях, положительные числа, уже округлены.\n\
          - total_expense = сумма РАСХОДОВ (потраченные деньги, is_income=false).\n\
          - total_income = сумма ДОХОДОВ (полученные деньги, is_income=true).\n\
+         - Аналитика НЕ включает переводы между счетами, копилку и операции накопительных счетов — это внутренние движения, а не траты/доходы. Цифры уже очищены, дополнительно ничего вычитать не нужно.\n\
          - net = total_income - total_expense. net > 0 значит доходы больше расходов.\n\
          - get_category_breakdown и get_top_merchants возвращают ТОЛЬКО расходы.\n\
          - monthly_projection = готовый прогноз расходов на 30 дней.\n\

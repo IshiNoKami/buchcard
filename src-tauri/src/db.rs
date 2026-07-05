@@ -501,13 +501,16 @@ pub fn get_spending_summary(conn: &Connection, from: &str, to: &str, category: O
     )?;
     let days = days.max(1);
 
+    // Как и на дашборде: без транзакций накопительных счетов; без снятых с учёта
+    // категорий (переводы, копилка) — если категория не запрошена явно.
     let (expense, income, count): (f64, f64, i64) = match category {
         Some(cat) => conn.query_row(
             "SELECT
                 COALESCE(SUM(CASE WHEN is_income=0 THEN amount ELSE 0 END), 0),
                 COALESCE(SUM(CASE WHEN is_income=1 THEN amount ELSE 0 END), 0),
                 COUNT(*)
-             FROM transactions WHERE date >= ?1 AND date <= ?2 AND category = ?3",
+             FROM transactions WHERE date >= ?1 AND date <= ?2 AND category = ?3
+               AND (import_id IS NULL OR import_id NOT IN (SELECT id FROM imports WHERE kopilka_id IS NOT NULL))",
             params![from, to, cat],
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )?,
@@ -516,7 +519,9 @@ pub fn get_spending_summary(conn: &Connection, from: &str, to: &str, category: O
                 COALESCE(SUM(CASE WHEN is_income=0 THEN amount ELSE 0 END), 0),
                 COALESCE(SUM(CASE WHEN is_income=1 THEN amount ELSE 0 END), 0),
                 COUNT(*)
-             FROM transactions WHERE date >= ?1 AND date <= ?2",
+             FROM transactions WHERE date >= ?1 AND date <= ?2
+               AND (import_id IS NULL OR import_id NOT IN (SELECT id FROM imports WHERE kopilka_id IS NOT NULL))
+               AND category NOT IN (SELECT name FROM categories WHERE excluded = 1)",
             params![from, to],
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )?,
@@ -539,18 +544,20 @@ pub fn get_spending_summary(conn: &Connection, from: &str, to: &str, category: O
 }
 
 pub fn get_category_totals(conn: &Connection, from: &str, to: &str) -> Result<Vec<CategoryTotal>> {
+    const FILTERS: &str = "AND (import_id IS NULL OR import_id NOT IN (SELECT id FROM imports WHERE kopilka_id IS NOT NULL))
+         AND category NOT IN (SELECT name FROM categories WHERE excluded = 1)";
     // denominator = only expense total so percentages are meaningful
     let total: f64 = conn.query_row(
-        "SELECT COALESCE(SUM(amount), 0) FROM transactions WHERE is_income=0 AND date >= ?1 AND date <= ?2",
+        &format!("SELECT COALESCE(SUM(amount), 0) FROM transactions WHERE is_income=0 AND date >= ?1 AND date <= ?2 {}", FILTERS),
         params![from, to],
         |row| row.get(0),
     ).unwrap_or(0.0);
 
-    let mut stmt = conn.prepare(
+    let mut stmt = conn.prepare(&format!(
         "SELECT category, SUM(amount) as total, COUNT(*) as cnt
-         FROM transactions WHERE is_income=0 AND date >= ?1 AND date <= ?2
-         GROUP BY category ORDER BY total DESC"
-    )?;
+         FROM transactions WHERE is_income=0 AND date >= ?1 AND date <= ?2 {}
+         GROUP BY category ORDER BY total DESC", FILTERS
+    ))?;
     let rows = stmt.query_map(params![from, to], |row| {
         Ok((row.get::<_, String>(0)?, row.get::<_, f64>(1)?, row.get::<_, i64>(2)?))
     })?;
@@ -570,6 +577,8 @@ pub fn get_monthly_totals(conn: &Connection, from: &str, to: &str) -> Result<Vec
                 COUNT(*) as cnt
          FROM transactions
          WHERE date >= ?1 AND date <= ?2
+           AND (import_id IS NULL OR import_id NOT IN (SELECT id FROM imports WHERE kopilka_id IS NOT NULL))
+           AND category NOT IN (SELECT name FROM categories WHERE excluded = 1)
          GROUP BY month ORDER BY month"
     )?;
     let rows = stmt.query_map(params![from, to], |row| {
@@ -619,10 +628,52 @@ pub fn renormalize_merchant_keys(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+/// Одноразовая миграция: входящие переводы, ранее помеченные «Доход»,
+/// перекатегорировать в «Переводы» (сопоставление в Rust — SQLite LOWER()
+/// не работает с кириллицей).
+pub fn recat_income_transfers(conn: &Connection) -> Result<usize> {
+    let done = conn.query_row(
+        "SELECT value FROM settings WHERE key = 'income_transfer_recat_v1'",
+        [],
+        |row| row.get::<_, String>(0),
+    ).map(|v| v == "1").unwrap_or(false);
+    if done { return Ok(0); }
+
+    let rows: Vec<(i64, String)> = {
+        let mut stmt = conn.prepare(
+            "SELECT id, description FROM transactions WHERE is_income = 1 AND category = 'Доход'"
+        )?;
+        let v: Vec<(i64, String)> = stmt
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .filter_map(|r| r.ok())
+            .collect();
+        v
+    };
+
+    let mut changed = 0;
+    for (id, desc) in rows {
+        if crate::categorizer::income_category(&desc) == "Переводы" {
+            conn.execute(
+                "UPDATE transactions SET category = 'Переводы' WHERE id = ?1",
+                params![id],
+            )?;
+            changed += 1;
+        }
+    }
+    conn.execute(
+        "INSERT INTO settings(key,value) VALUES('income_transfer_recat_v1','1')
+         ON CONFLICT(key) DO UPDATE SET value='1'",
+        [],
+    )?;
+    Ok(changed)
+}
+
 pub fn get_merchant_totals(conn: &Connection, from: &str, to: &str, limit: i64) -> Result<Vec<MerchantTotal>> {
     let mut stmt = conn.prepare(
         "SELECT merchant_key, category, SUM(amount) as total, COUNT(*) as cnt
          FROM transactions WHERE is_income=0 AND date >= ?1 AND date <= ?2 AND merchant_key != ''
+           AND (import_id IS NULL OR import_id NOT IN (SELECT id FROM imports WHERE kopilka_id IS NOT NULL))
+           AND category NOT IN (SELECT name FROM categories WHERE excluded = 1)
          GROUP BY merchant_key ORDER BY total DESC LIMIT ?3"
     )?;
     let rows = stmt.query_map(params![from, to, limit], |row| {
